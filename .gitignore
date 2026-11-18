@@ -1,0 +1,28 @@
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Measurement data and generated figures
+*.mat
+*.MAT
+*.h5
+*.hdf5
+*.pdf
+*.PDF
+
+# Local secrets and editor settings
+.env
+.env.*
+.vscode/
+.idea/
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db

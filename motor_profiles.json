@@ -1,0 +1,6 @@
+{
+  "motors": [
+    {"id": "default", "name": "Default", "U_nom": 460, "I_nom": 8.8,
+     "f_nom": 60, "P_nom": 5600, "tau_nom": 29.2, "n_p": 2}
+  ]
+}

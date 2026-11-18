@@ -1,0 +1,24 @@
+{
+  "scenarios": [
+    {"id": "hfsi", "label": "HFSI", "kind": "hfsi", "suffix": "_hfsi_2"},
+    {"id": "overview", "label": "Overview", "kind": "overview", "suffix": "_1"},
+    {"id": "injection-overview", "label": "Injection overview", "kind": "injection-overview", "suffix": "_2"},
+    {"id": "presentation", "label": "Presentation", "kind": "presentation", "suffix": "_online_meas"},
+    {
+      "id": "speed-torque",
+      "label": "Speed and torque",
+      "kind": "configured",
+      "suffix": "_speed_torque",
+      "columns": 2,
+      "panels": [
+        {"title": "Speed", "signals": [
+          {"key": "wm_ref", "unit": "rad/s", "scale": "1", "offset": "0"},
+          {"key": "w_m", "unit": "rad/s", "scale": "1", "offset": "0"}
+        ]},
+        {"title": "Torque", "signals": [
+          {"key": "tau_m", "unit": "Nm", "scale": "1", "offset": "0"}
+        ]}
+      ]
+    }
+  ]
+}

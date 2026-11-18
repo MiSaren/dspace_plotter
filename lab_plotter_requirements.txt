@@ -1,0 +1,4 @@
+# Standalone Tk plotting application; tested with Python 3.13.7 on Windows.
+numpy>=1.26
+h5py>=3.9
+matplotlib>=3.8
