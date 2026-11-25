@@ -117,6 +117,8 @@ from lab_plotter_core import (
 )
 from plot_style import PALETTES, downsample, set_latex_style, set_screen_style
 
+__version__ = '0.1.0'
+
 @dataclass
 class SignalSnapshot:
     t: np.ndarray
@@ -548,7 +550,7 @@ class PlotterApp:
         self.preview_path = None
         self.compare_paths = None
         self.previews = []
-        root.title(self.tr('Lab plotter — measurement browser'))
+        root.title(f"{self.tr('Lab plotter — measurement browser')} {__version__}")
         root.geometry('1400x900')
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.busy = False
@@ -655,7 +657,7 @@ class PlotterApp:
         """Translate the open window in place; an open link editor is closed."""
         self.language = language
         self.language_choice.set(LANGUAGES[language])
-        self.root.title(self.tr('Lab plotter — measurement browser'))
+        self.root.title(f"{self.tr('Lab plotter — measurement browser')} {__version__}")
         for widget, option, text in self._translations:
             if isinstance(option, tuple):
                 widget.heading(option[1], text=self.tr(text))

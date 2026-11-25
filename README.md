@@ -2,6 +2,8 @@
 
 A local desktop application for exploring dSPACE ControlDesk measurements saved as MATLAB v7.3 / HDF5 `.mat` files. No Jupyter notebook or web service is required. The interface is available in Finnish and English.
 
+Current version: 0.1.0, also shown in the window title. Changes are listed in [`CHANGELOG.md`](./CHANGELOG.md). Configuration file formats may still change in 0.x versions; the changelog describes any changes that require edits to existing files.
+
 ## Features
 
 - Browse measurement files and folders, preview signals, and export selected files to PDF.

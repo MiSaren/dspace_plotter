@@ -917,7 +917,7 @@ class PlotterAppTests(unittest.TestCase):
         self.app.choose_language()
         self.assertEqual(self.app.language, 'en')
         self.assertIsNone(self.app.map_dialog)
-        self.assertEqual(self.root.title(), 'Lab plotter — measurement browser')
+        self.assertEqual(self.root.title(), f'Lab plotter — measurement browser {app_module.__version__}')
         self.assertEqual(self.app.preview_button.cget('text'), 'Preview')
         self.assertEqual(self.app.files.heading('#0', 'text'), 'Measurement')
         self.assertEqual(self.app.files.set(item, 'state'), 'Added')
