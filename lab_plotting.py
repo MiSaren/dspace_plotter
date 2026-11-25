@@ -158,9 +158,7 @@ class LabDataMat:
                 "raster": x_index[i],
                 "samples": self.data_mat[self._refs[i]].shape[0],
             })
-        self._by_key = {s["key"]: s for s in self.signals}
-        self._by_key.update({s["legacy"]: s for s in self.signals})
-        self._by_key.update({s["full"]: s for s in self.signals})
+        self._by_key = _key_index(self.signals)
 
     # ------------------------------------------------------------------
     # Access
@@ -291,6 +289,20 @@ class LabDataMat:
         return (f"LabDataMat('{self.file_path.name}', "
                 f"{len(self.signals)} signals)")
 
+    def catalog(self, ranges=True):
+        """Detached SignalCatalog; ranges adds each signal's finite (min, max)."""
+        values = {}
+        if ranges:
+            for s in self.signals:
+                try:
+                    y = np.asarray(self.data_mat[self._refs[s["index"]]][:, 0], dtype=float)
+                except (TypeError, ValueError):
+                    continue
+                finite = y[np.isfinite(y)]
+                if finite.size:
+                    values[s["key"]] = (float(finite.min()), float(finite.max()))
+        return SignalCatalog(self.signals, self.raster_names, values)
+
     def plot(self, *groups, t_offset=0.0, xlim=None):
         """Quick-look plot. Each argument is one subplot: a key or a list
         of keys. Vector keys (e.g. "i_s_abc") plot all elements."""
@@ -329,6 +341,42 @@ class LabDataMat:
 
     def dataRouteAndName(self, filter="") -> None:
         self.list(filter, legacy=True)
+
+
+def _key_index(signals):
+    index = {s["key"]: s for s in signals}
+    index.update({s["legacy"]: s for s in signals})
+    index.update({s["full"]: s for s in signals})
+    return index
+
+
+def signal_source(info):
+    """Block path of a signal without "Model Root", e.g. "CTRL/Vector Control/PWM".
+
+    For a Simulink port (name "Out1") the key is the block name, so the path
+    shows the subsystem the signal comes from.
+    """
+    return info["path"].removeprefix("Model Root").strip("/")
+
+
+class SignalCatalog:
+    """Signal names of a closed recording, with the same key lookup as LabDataMat.
+
+    SignalCatalog(data.signals) supports keys(), signal_info() and ``in``,
+    but holds no samples or file handle. raster_names and ranges (key ->
+    finite (min, max)) are optional; see LabDataMat.catalog().
+    """
+
+    def __init__(self, signals, raster_names=(), ranges=None):
+        self.signals = [dict(s) for s in signals]
+        self.raster_names = list(raster_names)
+        self.ranges = dict(ranges or {})
+        self._by_key = _key_index(self.signals)
+
+    keys = LabDataMat.keys
+    _find = LabDataMat._find
+    signal_info = LabDataMat.signal_info
+    __contains__ = LabDataMat.__contains__
 
 
 def measurement_files(meas, plot_all=False):

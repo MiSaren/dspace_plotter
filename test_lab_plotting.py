@@ -11,7 +11,14 @@ from unittest.mock import patch
 import h5py
 import numpy as np
 
-from lab_plotting import LabDataMat, detect_spikes, detect_transients, measurement_files, transient_window
+from lab_plotting import (
+    LabDataMat,
+    detect_spikes,
+    detect_transients,
+    measurement_files,
+    signal_source,
+    transient_window,
+)
 
 
 class ReferenceData:
@@ -27,6 +34,58 @@ class ReferenceData:
 
     def time(self, key):
         return np.asarray(self.references[key][0])
+
+
+def write_recording(path, time, signals):
+    """Write a minimal ControlDesk-style MATLAB v7.3 file: signals are (name, path, values)."""
+    with h5py.File(path, 'w') as handle:
+        refs = handle.create_group('#refs#')
+        counter = iter(range(10**6))
+
+        def dataset(data):
+            return refs.create_dataset(f'r{next(counter)}', data=data).ref
+
+        def chars(text):
+            return np.array([[ord(c)] for c in text], dtype='uint16')
+
+        def ref_column(items):
+            column = np.empty((len(items), 1), dtype=h5py.ref_dtype)
+            column[:, 0] = items
+            return column
+
+        root = handle.create_group('recording')
+        x = root.create_group('X')
+        x.create_dataset('Data', data=np.asarray(time, dtype=float).reshape(-1, 1))
+        x.create_dataset('Raster', data=chars('HostService'))
+        y = root.create_group('Y')
+        y.create_dataset('Name', data=ref_column([dataset(chars(name)) for name, _, _ in signals]))
+        y.create_dataset('Path', data=ref_column([dataset(chars(where)) for _, where, _ in signals]))
+        y.create_dataset('XIndex', data=ref_column([dataset(np.array([[1.]])) for _ in signals]))
+        y.create_dataset('Data', data=ref_column([dataset(np.asarray(values, dtype=float).reshape(-1, 1))
+                                                  for _, _, values in signals]))
+
+
+class CatalogTests(unittest.TestCase):
+    def test_catalog_detaches_keys_ranges_and_block_paths(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'recording.mat'
+            write_recording(path, [0., 1., 2.], [
+                ('Out1', 'Model Root/CTRL/tauLref', [0., .5, np.nan]),
+                ('theta_m_out', 'Model Root/CTRL/Observer/MATLAB Function', [-1., 2., 0.]),
+                ('Out1[0]', 'Model Root/CTRL/i_c_abc', [1., 1., 1.]),
+                ('Out1[1]', 'Model Root/CTRL/i_c_abc', [np.nan, np.nan, np.nan])])
+            with LabDataMat(path) as data:
+                catalog = data.catalog()
+                without = data.catalog(ranges=False)
+        self.assertEqual(catalog.keys(), ['tauLref', 'theta_m_out', 'i_c_abc[0]', 'i_c_abc[1]'])
+        self.assertEqual(catalog.raster_names, ['HostService'])
+        self.assertEqual(catalog.ranges, {'tauLref': (0., .5), 'theta_m_out': (-1., 2.), 'i_c_abc[0]': (1., 1.)})
+        self.assertEqual(without.ranges, {})
+        self.assertIn('i_c_abc', catalog)
+        self.assertEqual(len(catalog.signal_info('i_c_abc')), 2)
+        self.assertEqual([signal_source(info) for info in catalog.signals],
+                         ['CTRL/tauLref', 'CTRL/Observer/MATLAB Function', 'CTRL/i_c_abc', 'CTRL/i_c_abc'])
+        self.assertEqual(signal_source({'path': 'Model Root'}), '')
 
 
 class TransientWindowTests(unittest.TestCase):

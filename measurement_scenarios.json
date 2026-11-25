@@ -12,11 +12,11 @@
       "columns": 2,
       "panels": [
         {"title": "Speed", "signals": [
-          {"key": "wm_ref", "unit": "rad/s", "scale": "1", "offset": "0"},
-          {"key": "w_m", "unit": "rad/s", "scale": "1", "offset": "0"}
+          {"key": "@w_m_ref"},
+          {"key": "@w_mest"}
         ]},
         {"title": "Torque", "signals": [
-          {"key": "tau_m", "unit": "Nm", "scale": "1", "offset": "0"}
+          {"key": "@tau_Mest"}
         ]}
       ]
     }

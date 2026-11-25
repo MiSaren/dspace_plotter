@@ -20,16 +20,66 @@ validated here but evaluated only by the renderer against its selected motor.
 I_nom, f_nom, P_nom, tau_nom and n_p. The numeric values must be positive and
 finite, and n_p must be an integer. Loaders read afresh on every call, return
 ID-keyed dictionaries in file order, and never modify the files.
+
+``signal_maps.json`` contains a ``signal_maps`` array linking the quantities
+(roles) of the built-in figures to recording keys of one dSPACE model. Each
+item has id, name and a ``signals`` object mapping a role from SIGNAL_ROLES to
+a key or an ordered list of alternative keys; the first key found in a
+recording is used, and an empty list leaves the quantity unlinked. Omitted
+roles use the built-in default keys. Without the file, only the built-in
+``default`` map exists. Only save_signal_map writes this file.
+
+Wherever a scenario names a recording key (configured signals, added traces,
+units), ``@role`` instead selects the key the active signal map links to that
+role, e.g. ``@w_m_ref``. A configured ``@role`` signal without a unit uses the
+role's recorded unit from SIGNAL_ROLES (ROLE_UNITS).
 """
 
 import ast
 import json
 import math
+import os
 import re
+import tempfile
 from pathlib import Path
 
 SCENARIO_PATH = Path(__file__).with_name('measurement_scenarios.json')
 MOTOR_PATH = Path(__file__).with_name('motor_profiles.json')
+SIGNAL_MAP_PATH = Path(__file__).with_name('signal_maps.json')
+
+# Quantities read by the built-in figures: (role, description, default keys,
+# vector, recorded unit). Roles are the attribute names of load_measurement
+# contexts. Vector roles name a 2-element (x + jy) or 3-element (abc) signal
+# without [index]. Units are those the presets assume; raw where unspecified.
+SIGNAL_ROLES = (
+    ('w_m_ref', 'Speed reference (electrical rad/s)', ('wm_ref',), False, 'rad/s'),
+    ('w_mest', 'Estimated speed (electrical rad/s)', ('w_m',), False, 'rad/s'),
+    ('w_m_meas', 'Measured speed (HFSI figure, default gain 1/2)', ('wm_meas',), False, 'raw'),
+    ('theta_m', 'Estimated rotor angle (electrical rad), also dq transform',
+     ('theta_m_out',), False, 'raw'),
+    ('theta_meas', 'Measured rotor angle (electrical rad)', ('thetam',), False, 'raw'),
+    ('psi_sref', 'Flux reference |ψs| (Wb)', ('psis_ref',), False, 'Wb'),
+    ('psi_sest', 'Estimated flux ψs (2-vector, Wb)', ('psi_s',), True, 'Wb'),
+    ('tau_Mref_lim', 'Limited torque reference (Nm)', ('tauM_ref_lim',), False, 'Nm'),
+    ('tau_Mest', 'Estimated torque (Nm)', ('tau_m',), False, 'Nm'),
+    ('tau_Lref', 'Load torque reference (p.u.)', ('tauLref', 'TL_ref'), False, 'p.u. (Nm)'),
+    ('i_cs', 'Measured currents (abc or 2-vector, A)', ('i_c_abc',), True, 'A'),
+    ('u_dc', 'DC voltage (V)', ('u_dc_lim',), False, 'V'),
+    ('u_c', 'Realized voltage (2-vector, V)', ('ucs_realized',), True, 'V'),
+    ('u_inj', 'Injection voltage (2-vector, V)', ('u_sd_inj',), True, 'V'),
+    ('eps_inj', 'Injection error signal (rad)', ('mon[3]',), False, 'raw'),
+    ('i_s', 'Stator current (2-vector, A)', ('i_s',), True, 'A'),
+    ('i_ref', 'Current reference (2-vector, A)', ('cur_is_ref',), True, 'A'),
+    ('w_inj', 'Observer monitor signal mon[4]', ('mon[4]',), False, 'raw'),
+)
+SIGNAL_ROLE_IDS = tuple(role for role, *_ in SIGNAL_ROLES)
+ROLE_UNITS = {role: unit for role, *_, unit in SIGNAL_ROLES}
+ROLE_PREFIX = '@'
+
+
+def signal_role(key):
+    """Return the role of an ``@role`` key, or None for a recording key."""
+    return key[len(ROLE_PREFIX):] if isinstance(key, str) and key.startswith(ROLE_PREFIX) else None
 
 _UNITS = frozenset(('raw', 'A', 'V', 'rad/s', 'Nm', 'Wb', 'Vs',
                     'rad/s (mechanical)', 'rpm (mechanical)',
@@ -80,6 +130,15 @@ def _object(value, required, allowed, where):
 def _text(value, where):
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f'{where} must be a nonempty string')
+    return value
+
+
+def _key(value, where):
+    """A recording key, or an @role key naming a known role."""
+    _text(value, where)
+    role = signal_role(value)
+    if role is not None and role not in SIGNAL_ROLE_IDS:
+        raise ValueError(f'{where}: unknown quantity role {value!r}')
     return value
 
 
@@ -154,7 +213,7 @@ def _builtin(item, kind):
         ids.add(trace_id)
         if type(trace['panel']) is not int or not 0 <= trace['panel'] < len(_PANEL_LINES[kind]):
             raise ValueError(f'Invalid added trace panel: {trace["panel"]!r}')
-        _text(trace['key'], 'added trace key')
+        _key(trace['key'], 'added trace key')
     transforms = item.get('transforms', {})
     if not isinstance(transforms, dict):
         raise ValueError('transforms must be an object')
@@ -167,7 +226,7 @@ def _builtin(item, kind):
     if not isinstance(units, dict):
         raise ValueError('units must be an object')
     for key, unit in units.items():
-        _text(key, 'unit signal key')
+        _key(key, 'unit signal key')
         _unit(unit, f'unit for {key}')
     item.update(disabled_traces=disabled, added_traces=added,
                 transforms=normalized, units=units)
@@ -189,11 +248,12 @@ def _configured(item):
         keys = set()
         for signal in signals:
             _object(signal, {'key'}, {'key', 'unit', 'scale', 'offset'}, 'signal')
-            key = _text(signal['key'], 'signal key')
+            key = _key(signal['key'], 'signal key')
             if key in keys:
                 raise ValueError(f'Duplicate signal key in panel: {key}')
             keys.add(key)
-            signal['unit'] = _unit(signal.get('unit', 'raw'), 'signal unit')
+            signal['unit'] = _unit(signal.get('unit', ROLE_UNITS.get(signal_role(key), 'raw')),
+                                   'signal unit')
             signal['scale'] = _expression(signal.get('scale', '1'), 'signal scale')
             signal['offset'] = _expression(signal.get('offset', '0'), 'signal offset')
 
@@ -247,3 +307,84 @@ def load_motor_profiles(path=MOTOR_PATH) -> dict[str, dict]:
                 raise ValueError(f'{field} must be a positive finite {"integer" if field == "n_p" else "number"}')
         result[motor_id] = motor
     return result
+
+
+def default_signal_map() -> dict:
+    """Return the built-in map, matching the keys the presets originally used."""
+    return {'id': 'default', 'name': 'Default',
+            'signals': {role: list(keys) for role, _, keys, *_ in SIGNAL_ROLES}}
+
+
+def signal_keys(value, where):
+    """Normalize one role's key or alternative keys to a list."""
+    keys = [value] if isinstance(value, str) else value
+    if not isinstance(keys, list):
+        raise ValueError(f'{where} must be a key or a list of keys')
+    for key in keys:
+        if not isinstance(key, str) or not key.strip() or key != key.strip():
+            raise ValueError(f'{where}: keys must be nonempty strings without surrounding spaces')
+    if len(set(keys)) != len(keys):
+        raise ValueError(f'{where}: duplicate keys')
+    return list(keys)
+
+
+def load_signal_maps(path=SIGNAL_MAP_PATH) -> dict[str, dict]:
+    """Read signal maps with every role normalized to a list of keys."""
+    if not Path(path).is_file():
+        return {'default': default_signal_map()}
+    result = {}
+    defaults = default_signal_map()['signals']
+    for item in _read(path, 'signal_maps'):
+        _object(item, {'id', 'name', 'signals'}, {'id', 'name', 'signals'}, 'signal map')
+        map_id = _id(item['id'], 'signal map id')
+        if map_id in result:
+            raise ValueError(f'Duplicate signal map ID: {map_id}')
+        _text(item['name'], 'signal map name')
+        signals = item['signals']
+        if not isinstance(signals, dict):
+            raise ValueError(f'signal map {map_id}: signals must be an object')
+        unknown = signals.keys() - set(SIGNAL_ROLE_IDS)
+        if unknown:
+            raise ValueError(f'signal map {map_id}: unknown roles {sorted(unknown)}')
+        result[map_id] = {'id': map_id, 'name': item['name'], 'signals': {
+            role: signal_keys(signals.get(role, defaults[role]), f'signal map {map_id}, {role}')
+            for role in SIGNAL_ROLE_IDS}}
+    return result
+
+
+def _format_signal_maps(entries):
+    blocks = []
+    for entry in entries:
+        roles = ',\n'.join(f'        {json.dumps(role)}: {json.dumps(keys, ensure_ascii=False)}'
+                           for role, keys in entry['signals'].items())
+        blocks.append('    {\n'
+                      f'      "id": {json.dumps(entry["id"])},\n'
+                      f'      "name": {json.dumps(entry["name"], ensure_ascii=False)},\n'
+                      '      "signals": {\n' + roles + '\n      }\n    }')
+    return '{\n  "signal_maps": [\n' + ',\n'.join(blocks) + '\n  ]\n}\n'
+
+
+def save_signal_map(entry, path=SIGNAL_MAP_PATH):
+    """Insert or replace one map by id, keeping the others in file order.
+
+    An invalid existing file is not overwritten. A missing file is created with
+    the built-in default map. The new content is validated before it atomically
+    replaces the file.
+    """
+    path = Path(path)
+    maps = load_signal_maps(path)
+    _object(entry, {'id', 'name', 'signals'}, {'id', 'name', 'signals'}, 'signal map')
+    maps[_id(entry['id'], 'signal map id')] = {
+        'id': entry['id'], 'name': _text(entry['name'], 'signal map name').strip(),
+        'signals': dict(entry['signals'])}
+    text = _format_signal_maps(maps.values())
+    handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=path.stem, suffix='.tmp')
+    try:
+        with os.fdopen(handle, 'w', encoding='utf-8', newline='\n') as target:
+            target.write(text)
+        load_signal_maps(temporary)
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+    return load_signal_maps(path)

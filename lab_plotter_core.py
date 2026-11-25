@@ -6,8 +6,16 @@ use the caller's Matplotlib style. No backend, display or export is configured.
 FIGURE_TYPES maps GUI names to (function, keyword options, export suffix).
 For custom panels, open LabDataMat in a with block, select from data.keys(), and
 pass lists of readable keys to plot_signals; each component keeps its own raster.
+
+Built-in plots read quantities (roles, see lab_plotter_config.SIGNAL_ROLES)
+through a signal map: role -> recording key or ordered alternative keys. The
+first alternative present with the expected shape is used; missing quantities
+are NaN. Reference transients follow the mapped w_m_ref and tau_Lref keys.
+Custom panels, added traces and spike detection accept ``@role`` keys, which
+select the signal map's key for that role and default to its recorded unit.
 """
 import ast
+import string
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
@@ -16,6 +24,14 @@ from matplotlib import pyplot as plt
 from matplotlib.ticker import AutoMinorLocator, MultipleLocator
 
 from lab_plotting import LabDataMat, transient_window
+from lab_plotter_config import (
+    ROLE_UNITS,
+    SIGNAL_ROLE_IDS,
+    SIGNAL_ROLES,
+    default_signal_map,
+    signal_keys,
+    signal_role,
+)
 from plot_style import downsample
 
 @dataclass
@@ -43,18 +59,99 @@ class BaseValues:
 
 DEFAULT_BASE = BaseValues(U_nom=460, I_nom=8.8, f_nom=60,
                           tau_nom=29.2, P_nom=5.6e3, n_p=2)
+DEFAULT_SIGNAL_MAP = default_signal_map()['signals']
+VECTOR_ROLES = frozenset(role for role, _, _, vector, _ in SIGNAL_ROLES if vector)
+REFERENCE_ROLES = ('w_m_ref', 'tau_Lref')
 
 
-def load_measurement(path, motor_base=None, *, x_step=None, extra_signals=None, **window_options):
-    """Load preset signals and detach requested extra components on their own rasters."""
+def complete_signal_map(signal_map=None):
+    """Return role -> list of alternative keys; omitted roles use the defaults."""
+    if signal_map is None:
+        signal_map = {}
+    if not isinstance(signal_map, dict):
+        raise ValueError('signal_map must map roles to recording keys')
+    unknown = set(signal_map) - set(SIGNAL_ROLE_IDS)
+    if unknown:
+        raise ValueError(f'Unknown signal roles: {sorted(unknown)}')
+    return {role: signal_keys(signal_map.get(role, DEFAULT_SIGNAL_MAP[role]), role)
+            for role in SIGNAL_ROLE_IDS}
+
+
+def signal_matches(data, key, vector):
+    """Whether a key exists with the shape a scalar or a 2/3-element vector role needs."""
+    if not key or key not in data:
+        return False
+    try:
+        count = len(data.signal_info(key))
+    except KeyError:
+        return False
+    return count in (2, 3) if vector else count == 1
+
+
+def resolve_signal_map(data, signal_map=None):
+    """Return role -> first matching key in data (LabDataMat or SignalCatalog), or None."""
+    return {role: next((key for key in keys if signal_matches(data, key, role in VECTOR_ROLES)), None)
+            for role, keys in complete_signal_map(signal_map).items()}
+
+
+def reference_thresholds(data, signal_map=None):
+    """transient_window thresholds for the mapped speed and load-torque references."""
+    resolved = resolve_signal_map(data, signal_map)
+    return dict.fromkeys(key for key in (resolved[role] for role in REFERENCE_ROLES) if key)
+
+
+def role_key(data, key, signal_map=None):
+    """Return the recording key an ``@role`` key selects; other keys pass through.
+
+    A key the data already knows (such as a detached snapshot entry) is kept.
+    """
+    role = signal_role(key)
+    if role is None or key in data:
+        return key
+    mapping = complete_signal_map(signal_map)
+    if role not in mapping:
+        raise ValueError(f'Unknown quantity role: {key}')
+    resolved = next((candidate for candidate in mapping[role]
+                     if signal_matches(data, candidate, role in VECTOR_ROLES)), None)
+    if resolved is None:
+        raise ValueError(f"{key}: no signal {' / '.join(mapping[role]) or '(not linked)'} "
+                         "in the recording; check the signal map")
+    return resolved
+
+
+def role_unit(key, default='raw'):
+    """Recorded unit of an ``@role`` key, or default for a recording key."""
+    return ROLE_UNITS.get(signal_role(key), default)
+
+
+def detection_options(data, signal_map=None, **window_options):
+    """transient_window options with mapped references and a resolved @role spike signal."""
+    options = dict(window_options)
+    if options.get('thresholds') is None:
+        options['thresholds'] = reference_thresholds(data, signal_map)
+    if options.get('detector') == 'spikes' and signal_role(options.get('spike_signal')):
+        options['spike_signal'] = role_key(data, options['spike_signal'], signal_map)
+    return options
+
+
+def load_measurement(path, motor_base=None, *, x_step=None, extra_signals=None,
+                     signal_map=None, **window_options):
+    """Load preset quantities via signal_map and detach requested extra components.
+
+    context.signal_map holds the key used for each role (None when missing).
+    Extra components keep their own rasters.
+    """
     motor_base = DEFAULT_BASE if motor_base is None else motor_base
+    mapping = complete_signal_map(signal_map)
     _validate_window(0, None, x_step)
     with LabDataMat(path) as data:
-        origin, limits = transient_window(data, **window_options)
+        resolved = resolve_signal_map(data, mapping)
+        origin, limits = transient_window(data, **detection_options(data, mapping, **window_options))
         context = SimpleNamespace(
             file_path=data.file_path.resolve(), name=data.file_path.stem,
             base=replace(motor_base), t=data.t.copy(), t_offset=origin,
-            t_span=limits, x_step=x_step, loaded=[], signal_rows=[], extra_signals={})
+            t_span=limits, x_step=x_step, loaded=[], signal_rows=[], extra_signals={},
+            signal_map=resolved)
 
         if extra_signals is not None:
             if isinstance(extra_signals, (str, bytes)):
@@ -63,7 +160,7 @@ def load_measurement(path, motor_base=None, *, x_step=None, extra_signals=None, 
                 if not isinstance(key, str) or not key:
                     raise ValueError('Extra signal keys must be nonempty strings')
                 try:
-                    signals = data.signal_info(key)
+                    signals = data.signal_info(role_key(data, key, mapping))
                     if not signals:
                         raise ValueError('no components found')
                     components = []
@@ -83,14 +180,23 @@ def load_measurement(path, motor_base=None, *, x_step=None, extra_signals=None, 
                 except (KeyError, TypeError, ValueError, IndexError) as error:
                     raise ValueError(f"{context.name}: cannot load extra signal '{key}': {error}") from error
 
-        def get(key, as_complex=False):
+        def get(role):
+            as_complex = role in VECTOR_ROLES
+            key = resolved[role]
+            missing = np.full(context.t.size, np.nan, dtype=complex if as_complex else float)
+            if key is None:
+                candidates = mapping[role]
+                context.loaded.append(candidates[0] if candidates else role)
+                if candidates:
+                    print(f"{context.name}: Warning: no unique {'vector ' if as_complex else ''}"
+                          f"signal {' / '.join(candidates)} for {role}; check the signal map")
+                return missing
             context.loaded.append(key)
             try:
                 y = data.complex(key) if as_complex else data[key]
             except (KeyError, ValueError) as error:
                 print(f"{context.name}: Warning: {error.args[0]}")
-                return np.full(context.t.size, np.nan,
-                               dtype=complex if as_complex else float)
+                return missing
             t_y = data.time(key)
             if not np.array_equal(t_y, context.t):
                 idx = np.clip(np.searchsorted(t_y, context.t, side="right") - 1,
@@ -98,31 +204,14 @@ def load_measurement(path, motor_base=None, *, x_step=None, extra_signals=None, 
                 y = y[..., idx]
             return y.copy()
 
-        context.theta_m = get("theta_m_out")
-        context.w_m_meas = get("wm_meas")
-        context.i_cs = get("i_c_abc", as_complex=True)
-        context.u_dc = get("u_dc_lim")
-        context.w_m_ref = get("wm_ref")
-        context.tau_Lref = get("tauLref" if "tauLref" in data or "TL_ref" not in data
-                               else "TL_ref")
-        context.tau_Mref_lim = get("tauM_ref_lim")
-        context.psi_sref = get("psis_ref")
-        context.i_ref = get("cur_is_ref", as_complex=True)
-        context.theta_mest = get("theta_m_out")
-        context.w_mest = get("w_m")
-        context.tau_Mest = get("tau_m")
-        context.psi_sest = get("psi_s", as_complex=True)
-        context.i_s = get("i_s", as_complex=True)
-        context.u_inj = get("u_sd_inj", as_complex=True)
-        # Model-version-dependent observer mon elements: check the signal table.
-        context.eps_inj = get("mon[3]")
-        context.w_inj = get("mon[4]")
-        context.u_c = get("ucs_realized", as_complex=True)
+        for role in SIGNAL_ROLE_IDS:
+            setattr(context, role, get(role))
+        context.theta_mest = context.theta_m.copy()
         context.w_m = context.w_mest
         context.i_c = context.i_cs*np.exp(-1j*context.theta_m)
         context.u_s = np.abs(context.u_c)
         context.theta_err_M = np.degrees(np.angle(np.exp(
-            1j*(context.theta_m - context.theta_mest))))/context.base.n_p
+            1j*(context.theta_meas - context.theta_m))))/context.base.n_p
         context.eps_inj_M = np.degrees(context.eps_inj)
 
         for key in context.loaded:
@@ -243,6 +332,7 @@ def plot_hfsi(context, t_offset=None, t_span=None, x_step=None):
     theta_err_M = context.theta_err_M
     theta_mest = context.theta_mest
     theta_m = context.theta_m
+    theta_meas = context.theta_meas
     width = 2*plt.rcParams["figure.figsize"][0]
     height = plt.rcParams["figure.figsize"][1]*3*4/5*3/5
     fig, axes = plt.subplots(3, 2, figsize=(width, height), sharex=True,
@@ -306,7 +396,7 @@ def plot_hfsi(context, t_offset=None, t_span=None, x_step=None):
     # angles
     wrap = lambda x: np.angle(np.exp(1j*x))  # wrap to (-pi, pi]
     ax_u.plot(t, wrap(theta_mest), color="C0", label=r"$\hat\vartheta_\mathrm{m}$")
-    ax_u.plot(t, wrap(theta_m), color="C1", label=r"$\vartheta_\mathrm{m}$")
+    ax_u.plot(t, wrap(theta_meas), color="C1", label=r"$\vartheta_\mathrm{m}$")
     ax_u.set_ylabel(r"$\vartheta_\mathrm{m}$ (rad)")
     ax_u.set_ylim([-np.pi, np.pi])
     ax_u.set_yticks([-np.pi, 0, np.pi], [r"$-\pi$", "0", r"$\pi$"])
@@ -481,47 +571,59 @@ def scalar_expression(expression, base):
     return result
 
 
-def subplot_traces(kind, groups=()):
+def subplot_traces(kind, groups=(), signal_map=None, unlinked='({role} not linked)'):
     """Describe every plotted trace and its editable pre-normalization gain.
 
     The stage column documents non-affine derived operations that remain intact.
     Offsets use the selected/stage signal's input units, before p.u. conversion.
+    Preset and @role sources show the signal_map keys (unlinked formats a role
+    without keys); 'roles' lists the quantities used. Titles are English.
     """
-    speed = [('wm_ref', '', '1', 'w'), ('w_m', '', '1', 'w')]
-    flux = [('psis_ref', 'abs', '1', 'psi'), ('psi_s', 'abs(complex)', '1', 'psi')]
-    torque = [('tauM_ref_lim', '', '1', 'tau'), ('tau_m', '', '1', 'tau'),
-              ('tauLref / TL_ref', 'recorded p.u.', '1', '')]
-    currents = [('i_c_abc + theta_m_out', 'real(complex current * exp(-j angle))', '1', 'i'),
-                ('i_c_abc + theta_m_out', 'imag(complex current * exp(-j angle))', '1', 'i')]
-    voltage = [('u_dc_lim', '', '1/sqrt3', 'u'), ('ucs_realized', 'abs(complex)', '1', 'u')]
+    mapping = complete_signal_map(signal_map)
+    names = {role: ' / '.join(keys) if keys else unlinked.format(role=role)
+             for role, keys in mapping.items()}
+    speed = [('{w_m_ref}', '', '1', 'w'), ('{w_mest}', '', '1', 'w')]
+    flux = [('{psi_sref}', 'abs', '1', 'psi'), ('{psi_sest}', 'abs(complex)', '1', 'psi')]
+    torque = [('{tau_Mref_lim}', '', '1', 'tau'), ('{tau_Mest}', '', '1', 'tau'),
+              ('{tau_Lref}', 'recorded p.u.', '1', '')]
+    currents = [('{i_cs} + {theta_m}', 'real(complex current * exp(-j angle))', '1', 'i'),
+                ('{i_cs} + {theta_m}', 'imag(complex current * exp(-j angle))', '1', 'i')]
+    voltage = [('{u_dc}', '', '1/sqrt3', 'u'), ('{u_c}', 'abs(complex)', '1', 'u')]
     if kind == 'custom':
-        return [{'panel': panel, 'title': f'Alikuvaaja {panel + 1}',
-                 'id': f'custom:{panel}:{key}', 'source': key, 'stage': 'recorded value',
-                 'scale': '1', 'offset': '0', 'divisor': ''}
+        def source(key):
+            role = signal_role(key)
+            return f'{key} → {names[role]}' if role in names else key
+        return [{'panel': panel, 'title': f'Subplot {panel + 1}',
+                 'id': f'custom:{panel}:{key}', 'source': source(key), 'stage': 'recorded value',
+                 'scale': '1', 'offset': '0', 'divisor': '',
+                 'roles': (signal_role(key),) if signal_role(key) in names else ()}
                 for panel, group in enumerate(groups) for key in group]
     if kind == 'hfsi':
-        torque = [('tauM_ref_lim', '', '1', 'tau_nom'), ('tau_m', '', '1', 'tau_nom'),
-                  ('tauLref / TL_ref', 'recorded p.u.; legacy rated-torque calibration', '1/0.88', '')]
-        panels = [('Nopeus', speed + [('wm_meas', '', '1/2', 'w')]),
-                  ('Virrat', currents), ('Vuo', flux),
-                  ('Kulmavirhe', [('mon[3]', 'degrees', '1', ''),
-                                 ('theta_m_out - theta_m_out', 'wrapped mechanical degrees', '1', '')]),
-                  ('Momentti', torque),
-                  ('Kulma', [('theta_m_out (observer)', 'wrap to (-pi, pi]', '1', ''),
-                             ('theta_m_out (measured)', 'wrap to (-pi, pi]', '1', '')])]
+        torque = [('{tau_Mref_lim}', '', '1', 'tau_nom'), ('{tau_Mest}', '', '1', 'tau_nom'),
+                  ('{tau_Lref}', 'recorded p.u.; legacy rated-torque calibration', '1/0.88', '')]
+        panels = [('Speed', speed + [('{w_m_meas}', '', '1/2', 'w')]),
+                  ('Currents', currents), ('Flux', flux),
+                  ('Angle error', [('{eps_inj}', 'degrees', '1', ''),
+                                 ('{theta_meas} - {theta_m}', 'wrapped mechanical degrees', '1', '')]),
+                  ('Torque', torque),
+                  ('Angle', [('{theta_m} (observer)', 'wrap to (-pi, pi]', '1', ''),
+                             ('{theta_meas} (measured)', 'wrap to (-pi, pi]', '1', '')])]
     elif kind in ('overview', 'injection-overview', 'presentation'):
         if kind == 'presentation':
             torque = [torque[1], torque[0], torque[2]]
-        panels = [('Nopeus', speed), ('Vuo', flux), ('Momentti', torque), ('Virrat', currents)]
+        panels = [('Speed', speed), ('Flux', flux), ('Torque', torque), ('Currents', currents)]
         if kind == 'overview':
-            panels.append(('Jännitteet', voltage))
+            panels.append(('Voltages', voltage))
         elif kind == 'injection-overview':
-            panels.append(('Injektiojännitteet', [('u_sd_inj', 'real(complex)', '1', ''),
-                                                 ('u_sd_inj', 'imag(complex)', '1', '')]))
+            panels.append(('Injection voltages', [('{u_inj}', 'real(complex)', '1', ''),
+                                                 ('{u_inj}', 'imag(complex)', '1', '')]))
     else:
         raise ValueError(f'Unknown figure type: {kind}')
     return [{'panel': panel, 'title': title, 'id': f'{kind}:{panel}:{line}',
-             'source': source, 'stage': stage, 'scale': scale, 'offset': '0', 'divisor': divisor}
+             'source': source.format(**names), 'stage': stage, 'scale': scale, 'offset': '0',
+             'divisor': divisor,
+             'roles': tuple(dict.fromkeys(field for _, field, _, _ in string.Formatter().parse(source)
+                                          if field))}
             for panel, (title, traces) in enumerate(panels)
             for line, (source, stage, scale, divisor) in enumerate(traces)]
 
@@ -672,7 +774,7 @@ def plot_measurement(context, figure_type, *, per_unit=None, transforms=None,
         scale = scalar_expression(change.get('scale', '1'), context.base)
         offset = scalar_expression(change.get('offset', '0'), context.base)
         for true_key, time, values in components:
-            unit = (units or {}).get(true_key, (units or {}).get(key, 'raw'))
+            unit = (units or {}).get(true_key, (units or {}).get(key, role_unit(key)))
             factor, display_unit = signal_scale(unit, context.base, bool(per_unit),
                                                 torque_mode=torque_mode)
             prepared.append((panel, f'{true_key} ({display_unit})',
@@ -741,15 +843,17 @@ def plot_measurement(context, figure_type, *, per_unit=None, transforms=None,
 
 def plot_signals(data, groups, t_offset=0, t_span=None, x_step=None, *,
                  per_unit=False, base=None, units=None, transforms=None,
-                 torque_mode='per_unit', columns=1):
+                 torque_mode='per_unit', columns=1, signal_map=None):
     """Plot signals in one panel per list, on each component's own raster.
 
     Arrange panels in row-major order using 1 to 8 columns; return only the
     occupied axes as a one-dimensional array in group order.
 
     units maps custom:{panel_index}:{key}, component keys, or selected keys to
-    SIGNAL_UNITS, in that precedence order. Missing entries remain raw; p.u.
-    inputs include their physical quantity so they can be denormalized.
+    SIGNAL_UNITS, in that precedence order. Missing entries remain raw (an
+    @role key uses its role's recorded unit); p.u. inputs include their
+    physical quantity so they can be denormalized. @role keys select the
+    signal_map key (default map when None) unless data already knows them.
     Rated torque uses base.tau_nom independently of other quantities' units.
     Per-line legend units distinguish mixed quantities on the same subplot.
 
@@ -771,7 +875,7 @@ def plot_signals(data, groups, t_offset=0, t_span=None, x_step=None, *,
         for key in group:
             if not isinstance(key, str) or not key:
                 raise ValueError("Signal keys must be nonempty readable strings")
-            signals = data.signal_info(key)
+            signals = data.signal_info(role_key(data, key, signal_map))
             if not signals:
                 raise ValueError(f"Signal '{key}' has no components")
             for signal in signals:
@@ -787,7 +891,7 @@ def plot_signals(data, groups, t_offset=0, t_span=None, x_step=None, *,
                     raise ValueError(f"Signal '{true_key}' must be a real vector matching its time")
                 unit_map = units or {}
                 trace_unit = unit_map.get(f'custom:{panel_index}:{key}',
-                                          unit_map.get(true_key, unit_map.get(key, 'raw')))
+                                          unit_map.get(true_key, unit_map.get(key, role_unit(key))))
                 factor, unit = signal_scale(trace_unit, motor_base, per_unit, torque_mode=torque_mode)
                 change = (transforms or {}).get(f'custom:{panel_index}:{key}', {'scale': '1', 'offset': '0'})
                 scale = scalar_expression(change['scale'], motor_base)

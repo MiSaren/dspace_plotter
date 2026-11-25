@@ -19,6 +19,7 @@ dist/
 *.PDF
 
 # Local secrets and editor settings
+lab_plotter_settings.json
 .env
 .env.*
 .vscode/

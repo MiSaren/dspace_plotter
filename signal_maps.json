@@ -1,0 +1,28 @@
+{
+  "signal_maps": [
+    {
+      "id": "default",
+      "name": "Default",
+      "signals": {
+        "w_m_ref": ["wm_ref"],
+        "w_mest": ["w_m"],
+        "w_m_meas": ["wm_meas"],
+        "theta_m": ["theta_m_out"],
+        "theta_meas": ["thetam"],
+        "psi_sref": ["psis_ref"],
+        "psi_sest": ["psi_s"],
+        "tau_Mref_lim": ["tauM_ref_lim"],
+        "tau_Mest": ["tau_m"],
+        "tau_Lref": ["tauLref", "TL_ref"],
+        "i_cs": ["i_c_abc"],
+        "u_dc": ["u_dc_lim"],
+        "u_c": ["ucs_realized"],
+        "u_inj": ["u_sd_inj"],
+        "eps_inj": ["mon[3]"],
+        "i_s": ["i_s"],
+        "i_ref": ["cur_is_ref"],
+        "w_inj": ["mon[4]"]
+      }
+    }
+  ]
+}

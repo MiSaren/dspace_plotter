@@ -312,6 +312,97 @@ class MeasurementTests(unittest.TestCase):
         self.assertNotIn("extra", second.loaded)
         self.assertEqual((second.t_offset, second.t_span, second.x_step), (3, (0, 1), 1))
 
+    def test_signal_map_alternatives_shapes_and_reference_detection(self):
+        class VectorData(SyntheticData):
+            def __contains__(self, key):  # LabDataMat also finds a vector by its base key
+                return key == 'motor/current' or super().__contains__(key)
+
+        data = VectorData()
+        data.signals['speed_ref'] = (data.t.copy(), np.array([0., 1., 1., 1.]))
+        signal_map = {'w_m_ref': 'speed_ref', 'w_mest': ['absent', 'tau_m'],
+                      'tau_Mest': 'motor/current', 'eps_inj': [], 'i_cs': 'motor/current'}
+        output = io.StringIO()
+        with patch.object(core, "LabDataMat", return_value=data), contextlib.redirect_stdout(output):
+            context = core.load_measurement(data.file_path, signal_map=signal_map)
+        self.assertTrue(data.closed)
+        self.assertEqual(context.signal_map['w_m_ref'], 'speed_ref')
+        self.assertEqual(context.signal_map['w_mest'], 'tau_m')
+        self.assertIsNone(context.signal_map['tau_Mest'])  # a vector cannot feed a scalar role
+        self.assertEqual(context.signal_map['i_cs'], 'motor/current')
+        self.assertIsNone(context.signal_map['eps_inj'])
+        np.testing.assert_array_equal(context.w_m_ref, [0, 1, 1, 1])
+        np.testing.assert_array_equal(context.w_mest, [10, 10, 20, 20])
+        self.assertTrue(np.all(np.isnan(context.tau_Mest)))
+        self.assertTrue(np.all(np.isnan(context.eps_inj)))
+        self.assertIn('motor/current for tau_Mest', output.getvalue())
+        self.assertNotIn('eps_inj', output.getvalue())
+        # The mapped speed reference changes at 3 s, the default wm_ref at 4 s.
+        self.assertAlmostEqual(context.t_offset, 2.8)
+        self.assertEqual(core.reference_thresholds(data), {'wm_ref': None})
+        self.assertEqual(core.reference_thresholds(data, {'w_m_ref': [], 'tau_Lref': ['tau_m']}),
+                         {'tau_m': None})
+        default = self.load(SyntheticData())
+        self.assertAlmostEqual(default.t_offset, 3.8)
+        self.assertEqual(default.signal_map['w_m_ref'], 'wm_ref')
+        for bad in ({'unknown': 'x'}, {'theta_m': 3}, ['wm_ref'], {'theta_m': ['a', 'a']}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.load(SyntheticData(), signal_map=bad)
+
+    def test_role_keys_in_custom_panels_added_traces_and_spike_detection(self):
+        data = SyntheticData()
+        signal_map = {'w_m_ref': ['absent', 'wm_ref'], 'tau_Mest': 'tau_m'}
+        fig, axes = core.plot_signals(data, [['@w_m_ref', 'tau_m'], ['@tau_Mest']], t_offset=2,
+                                      per_unit=True, units={}, signal_map=signal_map)
+        self.assertEqual([line.get_label() for line in axes[0].lines], ['wm_ref (p.u.)', 'tau_m (raw)'])
+        np.testing.assert_allclose(axes[0].lines[0].get_ydata(), np.array([0., 0., 2., 2.])/core.DEFAULT_BASE.w)
+        np.testing.assert_allclose(axes[1].lines[0].get_ydata(), np.array([10., 20.])/core.DEFAULT_BASE.tau)
+        plt.close(fig)
+        fig, axes = core.plot_signals(data, [['@tau_Mest']], units={'@tau_Mest': 'raw'}, per_unit=True)
+        np.testing.assert_allclose(axes[0].lines[0].get_ydata(), [10., 20.])
+        plt.close(fig)
+        before = set(plt.get_fignums())
+        for groups, expected in [([['@eps_inj']], 'no signal mon'), ([['@w_m_ref']], 'not linked')]:
+            with self.subTest(groups=groups), self.assertRaisesRegex(ValueError, expected):
+                core.plot_signals(data, groups, signal_map={'w_m_ref': []})
+        self.assertEqual(set(plt.get_fignums()), before)
+        self.assertEqual(core.role_key(data, 'tau_m'), 'tau_m')
+        self.assertEqual(core.role_key(data, '@tau_Mest'), 'tau_m')
+
+        context = self.load(SyntheticData(), t_offset=2, t_span=(0, 3), extra_signals=['@tau_Mest'])
+        self.assertEqual([item[0] for item in context.extra_signals['@tau_Mest']], ['tau_m'])
+        fig, axes = core.plot_measurement(context, 'overview', per_unit=True,
+                                          added_traces=[{'id': 'extra', 'panel': 2, 'key': '@tau_Mest'}])
+        self.assertEqual(axes[2].lines[-1].get_label(), 'tau_m (p.u.)')
+        np.testing.assert_allclose(axes[2].lines[-1].get_ydata(), np.array([10., 20.])/context.base.tau)
+        plt.close(fig)
+        spikes = SyntheticData()
+        spikes.signals['measured'] = (spikes.t.copy(), np.array([0., 0., 5., 0.]))
+        context = self.load(spikes, detector='spikes', spike_signal='@w_mest', spike_threshold=1.,
+                            signal_map={'w_mest': 'measured'})
+        self.assertAlmostEqual(context.t_offset, 3.8)
+        with self.assertRaisesRegex(ValueError, '@eps_inj'):
+            self.load(SyntheticData(), detector='spikes', spike_signal='@eps_inj', spike_threshold=1.)
+        traces = core.subplot_traces('custom', [['@w_m_ref', 'tau_m']], signal_map=signal_map)
+        self.assertEqual([trace['source'] for trace in traces], ['@w_m_ref → absent / wm_ref', 'tau_m'])
+        self.assertEqual([trace['roles'] for trace in traces], [('w_m_ref',), ()])
+
+    def test_trace_sources_and_roles_follow_signal_map(self):
+        default = {trace['id']: trace for trace in core.subplot_traces('hfsi')}
+        self.assertEqual(default['hfsi:4:2']['source'], 'tauLref / TL_ref')
+        self.assertEqual(default['hfsi:3:1']['source'], 'thetam - theta_m_out')
+        self.assertEqual(default['hfsi:1:0']['roles'], ('i_cs', 'theta_m'))
+        mapped = {trace['id']: trace for trace in core.subplot_traces(
+            'hfsi', signal_map={'theta_m': 'Observer/theta', 'eps_inj': []})}
+        self.assertEqual(mapped['hfsi:1:0']['source'], 'i_c_abc + Observer/theta')
+        self.assertEqual(mapped['hfsi:5:0']['source'], 'Observer/theta (observer)')
+        self.assertEqual(mapped['hfsi:3:0']['source'], '(eps_inj not linked)')
+        self.assertEqual({key: value['id'] for key, value in mapped.items()},
+                         {key: value['id'] for key, value in default.items()})
+        used = {role for kind in core.FIGURE_TYPES for trace in core.subplot_traces(kind)
+                for role in trace['roles']}
+        self.assertLessEqual(used, set(core.SIGNAL_ROLE_IDS))
+        self.assertEqual(set(core.SIGNAL_ROLE_IDS) - used, {'i_s', 'i_ref', 'w_inj'})
+
     def test_extra_signals_are_detached_and_bad_sources_close_recording(self):
         data = SyntheticData()
         context = self.load(data, extra_signals=['motor/current'])

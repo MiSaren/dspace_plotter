@@ -11,13 +11,20 @@ from matplotlib.backend_bases import MouseEvent
 
 import lab_plotter_app as app_module
 import lab_plotter_config as config_module
+from lab_plotting import SignalCatalog
 
 
 class PlotterAppTests(unittest.TestCase):
     def setUp(self):
+        settings = tempfile.TemporaryDirectory()
+        self.addCleanup(settings.cleanup)
+        self.settings_path = Path(settings.name) / 'settings.json'
+        patcher = patch.object(app_module, 'SETTINGS_PATH', self.settings_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.root = tk.Tk()
         self.root.withdraw()
-        self.app = app_module.PlotterApp(self.root)
+        self.app = app_module.PlotterApp(self.root, language='fi')
         self.app.files.unbind('<<TreeviewSelect>>')
         self.addCleanup(self.app.close)
         self.figure_numbers = set(app_module.plt.get_fignums())
@@ -30,6 +37,11 @@ class PlotterAppTests(unittest.TestCase):
                 self.fail('GUI operation did not complete')
             time.sleep(.01)
         self.root.update()
+
+    def select_signals(self, *keys):
+        self.app.signals.selection_clear(0, tk.END)
+        for key in keys:
+            self.app.signals.selection_set(self.app.listed_keys.index(key))
 
     @staticmethod
     def small_figure(_payload, _options):
@@ -106,8 +118,8 @@ class PlotterAppTests(unittest.TestCase):
                 options = self.app.options()
                 self.assertEqual(options['kind'], 'configured')
                 self.assertEqual(options['columns'], 2)
-                self.assertEqual(options['groups'], [['wm_ref', 'w_m'], ['tau_m']])
-                self.assertEqual(options['units']['custom:1:tau_m'], 'Nm')
+                self.assertEqual(options['groups'], [['@w_m_ref', '@w_mest'], ['@tau_Mest']])
+                self.assertEqual(options['units']['custom:1:@tau_Mest'], 'Nm')
                 self.assertEqual(options['panel_titles'], ['Speed', 'Torque'])
                 self.app.columns.set('3')
                 self.app.kind.set('hfsi')
@@ -116,8 +128,8 @@ class PlotterAppTests(unittest.TestCase):
                 self.app.columns.set('9')
                 with self.assertRaises(ValueError):
                     self.app.options()
-                self.app.signal_units['tau_m'] = 'A'
-                self.assertEqual(self.app.signal_units['tau_m'], 'A')
+                self.app.signal_units['@tau_Mest'] = 'A'
+                self.assertEqual(self.app.signal_units['@tau_Mest'], 'A')
                 scene = next(item for item in content['scenarios'] if item['id'] == 'speed-torque')
                 scene['label'] = 'Updated scenario'
                 scene['columns'] = 1
@@ -128,15 +140,15 @@ class PlotterAppTests(unittest.TestCase):
                 self.assertIn('Updated scenario [speed-torque]', self.app.scenario_choices)
                 options = self.app.options()
                 self.assertEqual(options['columns'], 1)
-                self.assertEqual(options['units']['custom:1:tau_m'], 'Nm')
-                self.assertEqual(options['transforms']['custom:1:tau_m']['scale'], 'n_p')
-                self.app.trace_tree.selection_set('speed-torque:1:tau_m')
+                self.assertEqual(options['units']['custom:1:@tau_Mest'], 'Nm')
+                self.assertEqual(options['transforms']['custom:1:@tau_Mest']['scale'], 'n_p')
+                self.app.trace_tree.selection_set('speed-torque:1:@tau_Mest')
                 self.app.trace_selected()
                 self.app.edit_scale.set('4')
                 self.app.edit_offset.set('0')
                 self.app.assign_transform()
                 self.app.reset_transform()
-                self.assertEqual(self.app.options()['transforms']['custom:1:tau_m']['scale'], 'n_p')
+                self.assertEqual(self.app.options()['transforms']['custom:1:@tau_Mest']['scale'], 'n_p')
 
     def test_configured_panel_removal_keeps_units_titles_and_transforms_aligned(self):
         self.app.kind.set('speed-torque')
@@ -144,18 +156,18 @@ class PlotterAppTests(unittest.TestCase):
         self.app.group_list.selection_set(0)
         self.app.remove_group()
         options = self.app.options()
-        self.assertEqual(options['groups'], [['tau_m']])
+        self.assertEqual(options['groups'], [['@tau_Mest']])
         self.assertEqual(options['panel_titles'], ['Torque'])
-        self.assertEqual(options['units']['custom:0:tau_m'], 'Nm')
-        self.assertEqual(options['transforms']['custom:0:tau_m']['scale'], '1')
+        self.assertEqual(options['units']['custom:0:@tau_Mest'], 'Nm')
+        self.assertEqual(options['transforms']['custom:0:@tau_Mest']['scale'], '1')
         self.assertEqual(options['y_limits'], {0: (-1., 1.)})
         self.assertEqual(self.app.kind.get(), 'speed-torque')
         self.app.signal_keys = ['wm_ref']
         self.app.filter_signals()
-        self.app.signals.selection_set(0)
+        self.select_signals('wm_ref')
         self.app.add_group()
         options = self.app.options()
-        self.assertEqual(options['groups'], [['tau_m'], ['wm_ref']])
+        self.assertEqual(options['groups'], [['@tau_Mest'], ['wm_ref']])
         self.assertEqual(options['panel_titles'], ['Torque', 'Alikuvaaja 2'])
         self.assertEqual(self.app.kind.get(), 'speed-torque')
 
@@ -231,7 +243,7 @@ class PlotterAppTests(unittest.TestCase):
     def test_custom_groups_and_numeric_validation(self):
         self.app.signal_keys = ['wm_ref', 'w_m', 'tau_m']
         self.app.filter_signals()
-        self.app.signals.selection_set(0, 1)
+        self.select_signals('wm_ref', 'w_m')
         self.app.add_group()
         self.assertEqual(self.app.groups, [['wm_ref', 'w_m']])
         self.app.parameters['duration'].set('0,5')
@@ -527,7 +539,7 @@ class PlotterAppTests(unittest.TestCase):
             self.app.select_all()
             self.app.signal_keys = ['wm_meas', 'tau_m']
             self.app.filter_signals()
-            self.app.signals.selection_set(0)
+            self.select_signals('wm_meas')
             self.app.input_unit.set('rad/s')
             self.app.assign_units()
             self.assertEqual(self.app.kind.get(), 'hfsi')
@@ -568,7 +580,7 @@ class PlotterAppTests(unittest.TestCase):
     def test_preset_added_trace_units_and_restore_are_scoped_per_plot_type(self):
         self.app.signal_keys = ['tau_m', 'wm_meas']
         self.app.filter_signals()
-        self.app.signals.selection_set(0, 1)
+        self.select_signals('tau_m', 'wm_meas')
         self.app.trace_tree.selection_set('panel:hfsi:0')
         self.app.add_preset_signals()
         self.assertEqual([item['key'] for item in self.app.preset_added['hfsi']],
@@ -593,6 +605,274 @@ class PlotterAppTests(unittest.TestCase):
         self.assertEqual(self.app.options()['added_traces'], [])
         self.assertEqual(self.app.options()['disabled_traces'], set())
         self.assertIn('overview:0:0', self.app.preset_disabled)
+
+    @staticmethod
+    def catalog(keys, paths=None, ranges=None):
+        return SignalCatalog([
+            {'index': index, 'key': key, 'legacy': f'{key}_{index}', 'name': key,
+             'path': (paths or {}).get(key, f'Model Root/{key}'), 'full': key, 'raster': 0, 'samples': 2}
+            for index, key in enumerate(keys)], ['main'], ranges)
+
+    def test_signal_map_profiles_status_editor_and_save(self):
+        keys = ['speed', 'w_m', 'psis_ref', 'psi_s[0]', 'psi_s[1]', 'min/tauM_ref_lim',
+                'online/tauM_ref_lim', 'tau_m', 'TL_ref', 'i_c_abc[0]', 'i_c_abc[1]', 'i_c_abc[2]',
+                'theta_m_out', 'u_dc_lim', 'ucs_realized[0]', 'ucs_realized[1]']
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'maps.json'
+            config_module.save_signal_map({'id': 'old', 'name': 'Old model', 'signals': {
+                'w_m_ref': ['speed'], 'tau_Mref_lim': ['online/tauM_ref_lim']}}, path)
+            with patch.object(app_module, 'SIGNAL_MAP_PATH', path), \
+                    patch.object(app_module, 'load_signal_maps',
+                                 side_effect=lambda: config_module.load_signal_maps(path)):
+                self.app.reload_configuration()
+                self.assertIn('Old model [old]', self.app.signal_map_choices)
+                self.app.kind.set('overview')
+                self.assertIn('Valitse mittaus', self.app.signal_map_status.get())
+                # Without a recording, the editor shows the first saved alternative.
+                self.app.edit_signal_map()
+                dialog = self.app.map_dialog
+                self.assertIn('Ei luettua mittausta', dialog.header.get())
+                self.assertEqual(dialog.rows['tau_Lref']['variable'].get(), 'tauLref')
+                dialog.close()
+                self.assertIsNone(self.app.map_dialog)
+
+                self.app.signal_catalog = self.catalog(keys)
+                self.app.signal_catalog_name = 'old.mat'
+                self.app.refresh_signal_map_status()
+                status = self.app.signal_map_status.get()
+                self.assertIn('old.mat: 9/11', status)
+                self.assertIn('Rajoitettu momenttiohje (Nm) (tauM_ref_lim)', status)
+                self.assertIn('Profiili "Old model" sopii paremmin (0 puuttuu)', status)
+                self.app.signal_map_choice.set('Old model [old]')
+                self.app.choose_signal_map()
+                self.assertIn('11/11', self.app.signal_map_status.get())
+                self.assertEqual(self.app.options()['signal_map']['w_m_ref'], ['speed'])
+                self.assertEqual(self.app.trace_tree.item('overview:0:0', 'text'), 'speed')
+                self.app.preset_disabled.add('overview:4:0')
+                self.assertNotIn('u_dc', self.app.needed_roles())
+                self.app.preset_disabled.clear()
+                self.app.kind.set('custom')
+                self.assertEqual(self.app.needed_roles(), ['w_m_ref', 'tau_Lref'])
+                self.app.kind.set('overview')
+
+                self.app.edit_signal_map()
+                dialog = self.app.map_dialog
+                rows = dialog.rows
+                self.assertIn('old.mat (16 signaalia)', dialog.header.get())
+                self.assertEqual(rows['w_m_ref']['variable'].get(), 'speed')
+                self.assertEqual(rows['w_m_ref']['status'].get(), '✓ löytyi')
+                self.assertEqual(rows['tau_Lref']['variable'].get(), 'TL_ref')
+                self.assertIn('vaihtoehdot tauLref / TL_ref', rows['tau_Lref']['status'].get())
+                self.assertEqual(rows['psi_sest']['choices'], ['psi_s', 'i_c_abc', 'ucs_realized'])
+                self.assertEqual(rows['u_inj']['status'].get(), '✗ ei tallenteessa')
+                rows['tau_Mref_lim']['variable'].set('tauM_ref_lim')
+                self.assertEqual(rows['tau_Mref_lim']['status'].get(),
+                                 '✗ moniselitteinen, valitse: min/tauM_ref_lim | online/tauM_ref_lim')
+                rows['tau_Mref_lim']['variable'].set('min/tauM_ref_lim')
+                rows['psi_sest']['variable'].set('tau_m')
+                self.assertIn('väärä muoto', rows['psi_sest']['status'].get())
+                rows['psi_sest']['variable'].set('psi_s')
+                rows['u_inj']['variable'].set('')
+                self.assertEqual(rows['u_inj']['status'].get(), '— ei linkitetty')
+                signals = dialog.collect()
+                self.assertEqual(signals['tau_Lref'], ['tauLref', 'TL_ref'])
+                self.assertEqual(signals['tau_Mref_lim'], ['min/tauM_ref_lim'])
+                self.assertEqual(signals['u_inj'], [])
+                self.assertEqual(signals['psi_sest'], ['psi_s'])
+                with patch.object(app_module.simpledialog, 'askstring', return_value='Lab B model'):
+                    dialog.save_new()
+                self.assertIsNone(self.app.map_dialog)
+                self.assertEqual(list(config_module.load_signal_maps(path)), ['default', 'old', 'Lab-B-model'])
+                self.assertEqual(self.app.signal_map_id.get(), 'Lab-B-model')
+                self.assertEqual(self.app.options()['signal_map']['tau_Mref_lim'], ['min/tauM_ref_lim'])
+                self.assertEqual(self.app.config_stamps(), self.app._config_stamps)
+
+                self.app.edit_signal_map()
+                dialog = self.app.map_dialog
+                dialog.rows['u_inj']['variable'].set('u_sd_inj')
+                with patch.object(app_module.messagebox, 'askyesno', return_value=False):
+                    dialog.save()
+                self.assertIs(self.app.map_dialog, dialog)
+                self.assertEqual(config_module.load_signal_maps(path)['Lab-B-model']['signals']['u_inj'], [])
+                with patch.object(app_module.messagebox, 'askyesno', return_value=True):
+                    dialog.save()
+                saved = config_module.load_signal_maps(path)['Lab-B-model']
+                self.assertEqual(saved['name'], 'Lab B model')
+                self.assertEqual(saved['signals']['u_inj'], ['u_sd_inj'])
+                self.assertEqual(saved['signals']['tau_Lref'], ['tauLref', 'TL_ref'])
+
+                path.write_text(json.dumps({'signal_maps': [{'id': 'other', 'name': 'Other', 'signals': {}}]}),
+                                encoding='utf-8')
+                self.root.after_cancel(self.app._config_timer)
+                self.app.poll_configuration()
+                self.assertEqual(self.app.signal_map_id.get(), 'other')
+                path.write_text('{invalid', encoding='utf-8')
+                with patch.object(app_module.messagebox, 'showerror') as error:
+                    self.app.reload_configuration()
+                error.assert_called_once()
+                self.assertEqual(list(self.app.signal_maps), ['other'])
+
+    def test_link_editor_shows_block_paths_and_full_signal_listing(self):
+        keys = ['wm_ref', 'theta_m_out', 'i_c_abc[0]', 'i_c_abc[1]', 'i_c_abc[2]', 'unused']
+        paths = {'theta_m_out': 'Model Root/CTRL/Observer/MATLAB Function',
+                 **{f'i_c_abc[{index}]': 'Model Root/CTRL/i_c_abc' for index in range(3)}}
+        self.app.signal_catalog = self.catalog(keys, paths, {'wm_ref': (0., 2.), 'theta_m_out': (-3.14159, 3.14159),
+                                                             'unused': (1., 1.)})
+        self.app.signal_catalog_name = 'm.mat'
+        self.app.edit_signal_map()
+        dialog = self.app.map_dialog
+        rows = dialog.rows
+        self.assertIn('theta_m_out  ·  CTRL/Observer/MATLAB Function', rows['theta_m']['box'].cget('values'))
+        self.assertIn('wm_ref', rows['w_m_ref']['box'].cget('values'))
+        self.assertEqual(list(rows['i_cs']['box'].cget('values')), ['', 'i_c_abc  ·  CTRL/i_c_abc'])
+        self.assertEqual(rows['theta_m']['status'].get(), '✓ löytyi · CTRL/Observer/MATLAB Function')
+        self.assertEqual(rows['w_m_ref']['status'].get(), '✓ löytyi')
+        rows['w_mest']['variable'].set('theta_m_out  ·  CTRL/Observer/MATLAB Function')
+        dialog.choice_selected('w_mest')
+        self.assertEqual(rows['w_mest']['variable'].get(), 'theta_m_out')
+        self.assertEqual(dialog.collect()['w_mest'], ['theta_m_out'])
+        postoffset = app_module.ttk.Style().lookup('SignalMap.TCombobox', 'postoffset')
+        self.assertGreater(int(str(postoffset).split()[2]), 0)
+        dialog.close()
+
+        text = app_module.signal_listing(self.app.signal_catalog, 'm.mat', self.app.tr)
+        lines = text.splitlines()
+        self.assertEqual(lines[0], 'Tallenne m.mat: 6 signaalia')
+        self.assertEqual(lines[2].split()[:3], ['#', 'Avain', 'Arvoalue'])
+        theta = next(line for line in lines if 'theta_m_out' in line)
+        self.assertIn('-3.142 … 3.142', theta)
+        self.assertTrue(theta.endswith('CTRL/Observer/MATLAB Function'))
+        self.assertEqual(next(line for line in lines if 'unused' in line).split()[:3], ['5', 'unused', '1'])
+        self.assertEqual(next(line for line in lines if 'i_c_abc[1]' in line).split()[:3], ['3', 'i_c_abc[1]', '–'])
+        self.app.show_signal_listing()
+        window = self.app.listing_window
+        texts = [child for frame in window.winfo_children() for child in frame.winfo_children()
+                 if isinstance(child, app_module.tk.Text)]
+        self.assertEqual(texts[0].get('1.0', 'end-1c'), text)
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / 'signals.txt'
+            with patch.object(app_module.filedialog, 'asksaveasfilename', return_value=str(target)) as ask:
+                self.app.save_signal_listing(text, window)
+            self.assertEqual(ask.call_args.kwargs['initialfile'], 'm_signals.txt')
+            self.assertEqual(target.read_text(encoding='utf-8'), text)
+        self.assertIn('Signaaliluettelo tallennettu', self.app.status.get())
+        window.destroy()
+        self.app.signal_catalog = None
+        self.app.show_signal_listing()
+        self.assertEqual(self.app.status.get(), 'Valitse ensin mittaus.')
+
+    def test_role_quantities_in_signal_list_custom_figure_and_loader(self):
+        self.app.kind.set('custom')
+        self.app.signal_keys = ['wm_ref', 'tau_m']
+        self.app.filter_signals()
+        self.assertEqual(self.app.listed_keys[:2], ['@w_m_ref', '@w_mest'])
+        self.assertEqual(self.app.listed_keys[-2:], ['wm_ref', 'tau_m'])
+        self.assertEqual(self.app.signals.get(0), '@w_m_ref')
+        self.app.signal_catalog = self.catalog(['wm_ref', 'tau_m'])
+        self.app.signal_catalog_name = 'x.mat'
+        self.app.filter_signals()
+        self.assertEqual(self.app.signals.get(0), '@w_m_ref → wm_ref')
+        self.assertEqual(self.app.signals.get(1), '@w_mest → ✗')
+        self.app.search.set('kuormamomentti')
+        self.assertEqual(self.app.listed_keys, ['@tau_Lref'])
+        self.app.search.set('')
+        self.select_signals('@w_m_ref', 'tau_m')
+        self.app.add_group()
+        self.assertEqual(self.app.groups, [['@w_m_ref', 'tau_m']])
+        self.assertEqual(self.app.group_list.get(0), '1: @w_m_ref [rad/s], tau_m [raw]')
+        self.assertEqual(self.app.trace_tree.item('custom:0:@w_m_ref', 'text'), '@w_m_ref → wm_ref')
+        self.assertEqual(self.app.needed_roles(), ['w_m_ref', 'tau_Lref'])
+        self.assertIn('x.mat: 1/2', self.app.signal_map_status.get())
+        self.assertIn('@w_mest', self.app.spike_selector.cget('values'))
+        options = self.app.options()
+        data = MagicMock()
+        data.t = np.array([0., 1.])
+        values = {'wm_ref': np.array([0., 2.]), 'tau_m': np.array([1., 3.])}
+        data.__contains__.side_effect = values.__contains__
+        data.__getitem__.side_effect = values.__getitem__
+        data.time.return_value = data.t
+        data.signal_info.side_effect = lambda key: [{'key': key}]
+        with patch.object(app_module, 'LabDataMat') as reader, \
+                patch.object(app_module, 'transient_window', return_value=(0., (0., 1.))):
+            reader.return_value.__enter__.return_value = data
+            payload = app_module.load_plot_request('m.mat', options)
+        self.assertEqual(payload[0].signal_info('@w_m_ref'), [{'key': 'wm_ref'}])
+        figure, axes = app_module.render_request(payload, options)
+        try:
+            self.assertEqual([line.get_label() for line in axes[0].lines], ['wm_ref (p.u.)', 'tau_m (raw)'])
+            np.testing.assert_allclose(axes[0].lines[0].get_ydata(), np.array([0., 2.])/options['base'].w)
+        finally:
+            app_module.plt.close(figure)
+
+    def test_language_switch_translates_window_and_is_remembered(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / 'a.mat'
+            source.touch()
+            self.app.insert_paths([source])
+        item = next(iter(self.app.path_ids))
+        self.app.kind.set('hfsi')
+        self.assertEqual(self.app.preview_button.cget('text'), 'Esikatsele')
+        self.assertEqual(self.app.files.set(item, 'state'), 'Lisätty')
+        self.assertEqual(self.app.trace_tree.item('panel:hfsi:0', 'text'), 'Nopeus')
+        self.app.edit_signal_map()
+        self.app.language_choice.set('English')
+        self.app.choose_language()
+        self.assertEqual(self.app.language, 'en')
+        self.assertIsNone(self.app.map_dialog)
+        self.assertEqual(self.root.title(), 'Lab plotter — measurement browser')
+        self.assertEqual(self.app.preview_button.cget('text'), 'Preview')
+        self.assertEqual(self.app.files.heading('#0', 'text'), 'Measurement')
+        self.assertEqual(self.app.files.set(item, 'state'), 'Added')
+        self.assertEqual(self.app.preview_source.get(), 'Preview: no figure')
+        self.assertEqual(self.app.trace_tree.item('panel:hfsi:0', 'text'), 'Speed')
+        self.assertIn('Free figure [custom]', self.app.scenario_choices)
+        self.assertEqual(self.app.status.get(), 'Language changed.')
+        self.assertIn('Select a measurement', self.app.signal_map_status.get())
+        self.app.parameters['n_p'].set('0')
+        with self.assertRaisesRegex(ValueError, 'Motor values must be positive'):
+            self.app.options()
+        self.app.parameters['n_p'].set('2')
+        self.app.edit_signal_map()
+        self.assertEqual(self.app.map_dialog.window.title(), 'Signal links — Default [default]')
+        self.app.map_dialog.close()
+        self.assertEqual(json.loads(self.settings_path.read_text(encoding='utf-8')), {'language': 'en'})
+        self.app.language_choice.set('Suomi')
+        self.app.choose_language()
+        self.assertEqual(self.app.preview_button.cget('text'), 'Esikatsele')
+        self.assertEqual(app_module.load_language(self.settings_path), 'fi')
+
+    def test_every_registered_widget_text_has_a_translation(self):
+        from lab_plotter_i18n import FINNISH, NEUTRAL
+        texts = {text for _, _, text in self.app._translations}
+        self.assertGreater(len(texts), 60)
+        self.assertEqual(sorted(text for text in texts if text not in FINNISH and text not in NEUTRAL), [])
+
+    def test_loaders_receive_selected_signal_map(self):
+        self.app.signal_maps['old'] = {'id': 'old', 'name': 'Old', 'signals': {
+            **self.app.signal_maps['default']['signals'], 'w_m_ref': ['speed'], 'tau_Lref': []}}
+        self.app.signal_map_id.set('old')
+        options = self.app.options()
+        with patch.object(app_module, 'load_measurement', return_value='context') as load:
+            self.assertEqual(app_module.load_plot_request('m.mat', options), 'context')
+        self.assertEqual(load.call_args.kwargs['signal_map']['w_m_ref'], ['speed'])
+        self.app.kind.set('custom')
+        self.app.groups = [['speed']]
+        options = self.app.options()
+        options['signal_map']['w_m_ref'] = ['mutated']
+        self.assertEqual(self.app.current_signal_map()['w_m_ref'], ['speed'])
+        options = self.app.options()
+        data = MagicMock()
+        data.t = np.arange(3.)
+        data.__contains__.side_effect = {'speed'}.__contains__
+        data.__getitem__.return_value = np.zeros(3)
+        data.time.return_value = data.t
+        data.signal_info.return_value = [{'key': 'speed'}]
+        with patch.object(app_module, 'LabDataMat') as reader, \
+                patch.object(app_module, 'transient_window', return_value=(0., (0., 2.))) as window:
+            reader.return_value.__enter__.return_value = data
+            app_module.load_plot_request('m.mat', options)
+        self.assertEqual(window.call_args.kwargs['thresholds'], {'speed': None})
+        self.assertNotIn('thresholds', options['window'])
 
     def test_rated_torque_uses_selected_editable_motor_profile(self):
         self.app.torque_mode.set('rated')
@@ -687,7 +967,7 @@ class PlotterAppTests(unittest.TestCase):
         self.assertEqual(self.app.transform_overrides['custom:1:other']['scale'], '3')
         self.app.signal_keys = ['replacement']
         self.app.filter_signals()
-        self.app.signals.selection_set(0)
+        self.select_signals('replacement')
         self.app.group_list.selection_set(0)
         self.app.replace_group()
         self.assertNotIn('custom:0:speed', self.app.transform_overrides)
@@ -704,7 +984,7 @@ class PlotterAppTests(unittest.TestCase):
             self.app.insert_paths([source])
             self.app.signal_keys = ['current']
             self.app.filter_signals()
-            self.app.signals.selection_set(0)
+            self.select_signals('current')
             self.app.add_group()
             self.app.input_unit.set('A')
             self.app.assign_units()

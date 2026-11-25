@@ -38,20 +38,35 @@ Blank intervals preserve preset defaults, with automatic minor divisions when
 needed. Intervals are in displayed units and are not rescaled when p.u. changes.
 All settings apply to previews and PDF exports for this session.
 
-references detects wm_ref/tauLref changes; spikes detects deviations beyond a
+The signal-map profile links the quantities of the built-in figures to the
+recording keys of a dSPACE model. Its status line reports which quantities of
+the current figure the active file lacks. The link editor lists the active
+file's signals per quantity and saves the profile to signal_maps.json, which is
+reloaded like the other configuration files. Unchanged rows keep their saved
+alternative keys. Custom and configured figures use recording keys directly,
+or @role quantities (listed first in the signal list) that follow the signal
+map and default to the role's recorded unit.
+
+The interface language (Finnish or English) is switched at the top of the
+sidebar; the choice is stored per user in lab_plotter_settings.json.
+
+references detects changes of the mapped speed and load-torque references
+(default wm_ref, tauLref/TL_ref); spikes detects deviations beyond a
 positive raw-unit threshold from a selected signal's whole-recording median.
 Each detector uses original data on its own raster, before plotting transforms;
 without events the full recording is used. This is not peak-prominence or
 settling-time detection, and a missing selected spike signal fails that file.
 """
 import copy
+import re
 import sys
 import tempfile
 import tkinter as tk
+import tkinter.font as tkfont
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from uuid import uuid4
 
 import matplotlib
@@ -63,15 +78,34 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.colors import to_rgba
 from matplotlib.ticker import AutoMinorLocator, MultipleLocator, NullLocator, ScalarFormatter
 
-from lab_plotter_config import MOTOR_PATH, SCENARIO_PATH, load_motor_profiles, load_scenarios
-from lab_plotting import LabDataMat, transient_window
+from lab_plotter_config import (
+    MOTOR_PATH,
+    SCENARIO_PATH,
+    SIGNAL_MAP_PATH,
+    SIGNAL_ROLES,
+    load_motor_profiles,
+    load_scenarios,
+    load_signal_maps,
+    save_signal_map,
+    signal_role,
+)
+from lab_plotter_i18n import LANGUAGES, SETTINGS_PATH, load_language, save_language, translate
+from lab_plotting import LabDataMat, signal_source, transient_window
 from lab_plotter_core import (
+    FIGURE_TYPES,
+    REFERENCE_ROLES,
     SIGNAL_UNITS,
+    VECTOR_ROLES,
     BaseValues,
+    detection_options,
     load_measurement,
     plot_measurement,
     plot_signals,
+    resolve_signal_map,
+    role_key,
+    role_unit,
     scalar_expression,
+    signal_matches,
     subplot_traces,
 )
 from plot_style import PALETTES, downsample, set_latex_style, set_screen_style
@@ -86,6 +120,9 @@ class SignalSnapshot:
     def signal_info(self, key):
         return self.infos[key]
 
+    def __contains__(self, key):
+        return key in self.infos or key in self.signals
+
     def __getitem__(self, key):
         return self.signals[key]
 
@@ -98,11 +135,14 @@ def load_plot_request(path, options):
     if options['kind'] not in ('custom', 'configured'):
         extra = [trace['key'] for trace in options.get('added_traces', ())]
         return load_measurement(path, options['base'], x_step=options['x_step'],
-                                extra_signals=extra, **options['window'])
+                                extra_signals=extra, signal_map=options.get('signal_map'),
+                                **options['window'])
+    signal_map = options.get('signal_map')
     with LabDataMat(path) as data:
-        origin, limits = transient_window(data, **options['window'])
+        origin, limits = transient_window(data, **detection_options(data, signal_map, **options['window']))
         keys = dict.fromkeys(key for group in options['groups'] for key in group)
-        infos = {key: data.signal_info(key) for key in keys}
+        # @role keys stay as group keys; their infos name the linked recording signals.
+        infos = {key: data.signal_info(role_key(data, key, signal_map)) for key in keys}
         components = dict.fromkeys(info['key'] for signals in infos.values() for info in signals)
         snapshot = SignalSnapshot(data.t.copy(),
                                   {key: data[key].copy() for key in components},
@@ -236,10 +276,233 @@ def render_request(payload, options):
         raise
 
 
+_INDEXED = re.compile(r'\[\d+\]$')
+
+
+def key_source(catalog, key):
+    """Block path a key (or the first element of a vector key) is recorded from."""
+    try:
+        return signal_source(catalog.signal_info(key)[0])
+    except (KeyError, IndexError):
+        return ''
+
+
+def choice_text(catalog, key):
+    source = key_source(catalog, key)
+    return f'{key}  ·  {source}' if source and source != key else key
+
+
+def format_range(bounds):
+    if bounds is None:
+        return '–'
+    low, high = bounds
+    return f'{low:.4g}' if low == high else f'{low:.4g} … {high:.4g}'
+
+
+def signal_listing(catalog, name, tr):
+    """Text table of every signal: index, key, finite range, samples and block path."""
+    several = len({s['raster'] for s in catalog.signals}) > 1 and catalog.raster_names
+    rows = []
+    for s in catalog.signals:
+        samples = str(s['samples'])
+        if several:
+            samples += f" [{catalog.raster_names[s['raster']]}]"
+        rows.append((str(s['index']), s['key'], format_range(catalog.ranges.get(s['key'])),
+                     samples, signal_source(s) or '—'))
+    header = ('#', tr('Key'), tr('Range'), tr('Samples'), tr('Source (block path)'))
+    widths = [max(len(row[column]) for row in (header, *rows)) for column in range(4)]
+    lines = [tr('Recording {name}: {count} signals', name=name, count=len(rows)), '']
+    for row in (header, *rows):
+        cells = [row[0].rjust(widths[0])] + [cell.ljust(width) for cell, width in zip(row[1:4], widths[1:])]
+        lines.append('  '.join(cells + [row[4]]))
+    return '\n'.join(lines) + '\n'
+
+
+def role_usage(tr, scenarios=None):
+    """Short description of the figures, scenarios and detection reading each role."""
+    usage = {role: [] for role, *_ in SIGNAL_ROLES}
+    for kind in FIGURE_TYPES:
+        for trace in subplot_traces(kind):
+            for role in trace['roles']:
+                if kind not in usage[role]:
+                    usage[role].append(kind)
+    extra = {role: [] for role in usage}
+    for scene_id, scene in (scenarios or {}).items():
+        keys = [trace['key'] for trace in scene.get('added_traces', ())]
+        keys += [signal['key'] for panel in scene.get('panels', ()) for signal in panel['signals']]
+        for role in dict.fromkeys(signal_role(key) for key in keys):
+            if role in extra:
+                extra[role].append(scene_id)
+    result = {}
+    for role, kinds in usage.items():
+        names = [tr('all figures')] if len(kinds) == len(FIGURE_TYPES) else kinds
+        text = ', '.join(names + extra[role]) or tr('not plotted')
+        result[role] = tr('{figures} + transients', figures=text) if role in REFERENCE_ROLES else text
+    return result
+
+
+class SignalMapDialog:
+    """Link each quantity of the built-in figures to a key of the active recording.
+
+    A row left at its initial value keeps the profile's saved alternative keys;
+    an edited row stores exactly the chosen key, and an empty row unlinks it.
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self.map_id = app.signal_map_id.get()
+        self.profile = copy.deepcopy(app.signal_maps[self.map_id])
+        self.catalog = None
+        self.window = tk.Toplevel(app.root)
+        tr = app.tr
+        self.window.title(tr('Signal links — {name} [{id}]', name=self.profile['name'], id=self.map_id))
+        self.window.transient(app.root)
+        self.header = tk.StringVar()
+        self.message = tk.StringVar(value=tr('Choose a recording signal for each quantity. '
+                                             'Empty = not linked (the quantity is plotted empty).'))
+        ttk.Label(self.window, textvariable=self.header, padding=6, wraplength=1000).pack(anchor=tk.W)
+        grid = ttk.Frame(self.window, padding=(6, 0))
+        grid.pack(fill=tk.BOTH, expand=True)
+        for column, text in enumerate((tr('Quantity'), tr('Role'), tr('Used by'),
+                                       tr('Recording signal'), tr('Status'))):
+            ttk.Label(grid, text=text, font='TkHeadingFont').grid(row=0, column=column, sticky='w', padx=3)
+        usage = role_usage(tr, app.scenarios)
+        self.rows = {}
+        for row, (role, label, _, vector, _) in enumerate(SIGNAL_ROLES, 1):
+            variable, status = tk.StringVar(), tk.StringVar()
+            ttk.Label(grid, text=tr(label)).grid(row=row, column=0, sticky='w', padx=3)
+            ttk.Label(grid, text=role).grid(row=row, column=1, sticky='w', padx=3)
+            ttk.Label(grid, text=usage[role]).grid(row=row, column=2, sticky='w', padx=3)
+            box = ttk.Combobox(grid, textvariable=variable, width=44, style='SignalMap.TCombobox')
+            box.grid(row=row, column=3, sticky='ew', padx=3, pady=1)
+            box.bind('<<ComboboxSelected>>', lambda _event, role=role: self.choice_selected(role))
+            ttk.Label(grid, textvariable=status, wraplength=330).grid(
+                row=row, column=4, sticky='w', padx=3)
+            self.rows[role] = {'variable': variable, 'status': status, 'box': box,
+                               'initial': '', 'vector': vector, 'choices': [], 'display': {}}
+            variable.trace_add('write', lambda *_args, role=role: self.update_status(role))
+        grid.columnconfigure(3, weight=1)
+        ttk.Label(self.window, textvariable=self.message, padding=6, wraplength=1000).pack(anchor=tk.W)
+        buttons = ttk.Frame(self.window, padding=6)
+        buttons.pack(fill=tk.X)
+        ttk.Button(buttons, text=tr('Save to profile'), command=self.save).pack(side=tk.LEFT)
+        ttk.Button(buttons, text=tr('Save as new profile…'), command=self.save_new).pack(side=tk.LEFT)
+        ttk.Button(buttons, text=tr('List all signals…'), command=app.show_signal_listing).pack(side=tk.LEFT)
+        ttk.Button(buttons, text=tr('Close'), command=self.close).pack(side=tk.RIGHT)
+        self.window.protocol('WM_DELETE_WINDOW', self.close)
+        self.set_catalog(app.signal_catalog, app.signal_catalog_name)
+
+    def set_catalog(self, catalog, name):
+        """Offer a recording's keys; unedited rows show the key the profile resolves to."""
+        self.catalog = catalog
+        keys = catalog.keys() if catalog is not None else []
+        vectors = [key for key in dict.fromkeys(_INDEXED.sub('', key) for key in keys if _INDEXED.search(key))
+                   if signal_matches(catalog, key, True)]
+        resolved = resolve_signal_map(catalog, self.profile['signals']) if catalog is not None else {}
+        for role, row in self.rows.items():
+            row['choices'] = vectors if row['vector'] else list(keys)
+            # The list shows where each signal comes from; choosing an entry enters its key.
+            row['display'] = {choice_text(catalog, key): key for key in row['choices']}
+            row['box'].configure(values=['', *row['display']])
+            if row['variable'].get() == row['initial']:
+                saved = self.profile['signals'][role]
+                row['initial'] = resolved.get(role) or (saved[0] if saved else '')
+                row['variable'].set(row['initial'])
+            self.update_status(role)
+        texts = [text for row in self.rows.values() for text in row['display']]
+        if texts:
+            # ttk sizes the drop-down to the combobox; widen it to fit the block paths.
+            longest = max(tkfont.nametofont('TkDefaultFont').measure(text) for text in texts)
+            extra = max(0, longest + 40 - next(iter(self.rows.values()))['box'].winfo_reqwidth())
+            ttk.Style(self.window).configure('SignalMap.TCombobox', postoffset=(0, 0, extra, 0))
+        tr = self.app.tr
+        self.header.set(tr('Recording: {name} ({count} signals). The list shows the block path of each '
+                           'signal; vector quantities list 2–3-element vectors without [index].',
+                           name=name, count=len(keys)) if catalog is not None else
+                        tr('No measurement read: select a file in the main window to see its signals '
+                           'and the link status here.'))
+
+    def choice_selected(self, role):
+        row = self.rows[role]
+        key = row['display'].get(row['variable'].get())
+        if key is not None:
+            row['variable'].set(key)
+
+    def update_status(self, role):
+        tr = self.app.tr
+        row = self.rows[role]
+        value = row['variable'].get().strip()
+        if not value:
+            text = tr('— not linked')
+        elif self.catalog is None:
+            text = tr('no recording to check')
+        elif signal_matches(self.catalog, value, row['vector']):
+            source = key_source(self.catalog, value)
+            text = tr('✓ found') + (f' · {source}' if source and source != value else '')
+        elif value in self.catalog:
+            text = tr('✗ wrong shape: {expected}',
+                      expected=tr('2–3-element vector') if row['vector'] else tr('single signal'))
+        else:
+            # Several block paths end with this name: list them instead of guessing.
+            matches = [key for key in row['choices'] if key.endswith('/' + value)]
+            text = (tr('✗ ambiguous, choose: {keys}', keys=' | '.join(matches)) if matches
+                    else tr('✗ not in the recording'))
+        saved = self.profile['signals'][role]
+        if value == row['initial'] and len(saved) > 1:
+            text += ' · ' + tr('alternatives {keys}', keys=' / '.join(saved))
+        row['status'].set(text)
+
+    def collect(self):
+        signals = {}
+        for role, row in self.rows.items():
+            value = row['variable'].get().strip()
+            signals[role] = (list(self.profile['signals'][role]) if value == row['initial']
+                             else [value] if value else [])
+        return signals
+
+    def save(self):
+        name = self.profile['name']
+        if messagebox.askyesno(self.app.tr('Save signal map'),
+                               self.app.tr('Replace the links of profile "{name}" in {file}?',
+                                           name=name, file=SIGNAL_MAP_PATH.name), parent=self.window):
+            self.write(self.map_id, name)
+
+    def save_new(self):
+        name = simpledialog.askstring(self.app.tr('New signal map'),
+                                      self.app.tr('Profile name (e.g. the name of the dSPACE model):'),
+                                      parent=self.window)
+        if name is None or not name.strip():
+            return
+        base = re.sub(r'[^A-Za-z0-9_-]+', '-', name.strip()).strip('-') or 'map'
+        map_id, number = base, 2
+        while map_id in self.app.signal_maps:
+            map_id, number = f'{base}-{number}', number + 1
+        self.write(map_id, name.strip())
+
+    def write(self, map_id, name):
+        try:
+            save_signal_map({'id': map_id, 'name': name, 'signals': self.collect()}, SIGNAL_MAP_PATH)
+        except (OSError, ValueError) as error:
+            messagebox.showerror(self.app.tr('Saving failed'), str(error), parent=self.window)
+            return
+        self.close()
+        self.app.signal_map_saved(map_id)
+
+    def close(self):
+        if self.window.winfo_exists():
+            self.window.destroy()
+        if self.app.map_dialog is self:
+            self.app.map_dialog = None
+
+
 class PlotterApp:
-    def __init__(self, root):
+    def __init__(self, root, language=None):
         self.root = root
-        root.title('Lab plotter — mittausselain')
+        self.language = language if language in LANGUAGES else load_language(SETTINGS_PATH)
+        self._translations = []
+        self.file_states = {}
+        self.preview_path = None
+        root.title(self.tr('Lab plotter — measurement browser'))
         root.geometry('1400x900')
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.busy = False
@@ -249,6 +512,15 @@ class PlotterApp:
         self.figure = self.canvas = self.toolbar = None
         self.scenarios = load_scenarios()
         self.motor_profiles = load_motor_profiles()
+        self.signal_maps = load_signal_maps()
+        self.signal_map_id = tk.StringVar(value=next(iter(self.signal_maps)))
+        self.signal_map_choice = tk.StringVar()
+        self.signal_map_status = tk.StringVar()
+        self.signal_catalog = None
+        self.signal_catalog_name = ''
+        self.signal_catalog_path = None
+        self.listing_window = None
+        self.map_dialog = None
         self.signal_keys = []
         self.groups = []
         self.scene_groups = {'custom': self.groups}
@@ -289,8 +561,8 @@ class PlotterApp:
         self.torque_mode = tk.StringVar(value='per_unit')
         self.input_unit = tk.StringVar(value='raw')
         self.path_ids = {}
-        self.status = tk.StringVar(value='Lisää mittaustiedostoja tai kansio.')
-        self.preview_source = tk.StringVar(value='Esikatselu: ei kuvaa')
+        self.status = tk.StringVar(value=self.tr('Add measurement files or a folder.'))
+        self.preview_source = tk.StringVar(value=self.tr('Preview: no figure'))
         self.kind = tk.StringVar(value=first_scene)
         self.active_scene = first_scene
         self.scenario_choice = tk.StringVar()
@@ -308,6 +580,57 @@ class PlotterApp:
         self._failed_config_stamps = None
         self._config_timer = root.after(1200, self.poll_configuration)
         root.protocol('WM_DELETE_WINDOW', self.close)
+
+    def tr(self, text, **values):
+        """Text in the interface language; values fill {name} fields."""
+        return translate(text, self.language, **values)
+
+    def _t(self, widget, text, option='text'):
+        """Give a widget a translated text that follows language changes."""
+        self._translations.append((widget, option, text))
+        widget.configure(**{option: self.tr(text)})
+        return widget
+
+    def _heading(self, tree, column, text):
+        self._translations.append((tree, ('heading', column), text))
+        tree.heading(column, text=self.tr(text))
+
+    def choose_language(self, _event=None):
+        language = next((code for code, name in LANGUAGES.items()
+                         if name == self.language_choice.get()), None)
+        if language is not None and language != self.language:
+            self.set_language(language)
+            save_language(language, SETTINGS_PATH)
+
+    def set_language(self, language):
+        """Translate the open window in place; an open link editor is closed."""
+        self.language = language
+        self.language_choice.set(LANGUAGES[language])
+        self.root.title(self.tr('Lab plotter — measurement browser'))
+        for widget, option, text in self._translations:
+            if isinstance(option, tuple):
+                widget.heading(option[1], text=self.tr(text))
+            else:
+                widget.configure(**{option: self.tr(text)})
+        for item, state in self.file_states.items():
+            self.files.set(item, 'state', self.tr(state))
+        self.render_preview_source()
+        if self.map_dialog is not None:
+            self.map_dialog.close()
+        if self.listing_window is not None and self.listing_window.winfo_exists():
+            self.listing_window.destroy()
+        self.update_scenario_choices()
+        self.filter_signals()
+        self.refresh_groups(switch_to_custom=False)
+        self.status.set(self.tr('Language changed.'))
+
+    def render_preview_source(self):
+        self.preview_source.set(self.tr('Preview: {path}', path=self.preview_path)
+                                if self.preview_path is not None else self.tr('Preview: no figure'))
+
+    def set_file_state(self, item, state):
+        self.file_states[item] = state
+        self.files.set(item, 'state', self.tr(state))
 
     def scene_kind(self, scene_id=None):
         scene_id = self.kind.get() if scene_id is None else scene_id
@@ -369,7 +692,7 @@ class PlotterApp:
     def update_scenario_choices(self):
         self.scenario_choices = {f'{scene["label"]} [{scene_id}]': scene_id
                                  for scene_id, scene in self.scenarios.items()}
-        self.scenario_choices['Vapaa kuva [custom]'] = 'custom'
+        self.scenario_choices[f'{self.tr("Free figure")} [custom]'] = 'custom'
         self.kind_selector.configure(values=tuple(self.scenario_choices))
         for label, scene_id in self.scenario_choices.items():
             if scene_id == self.kind.get():
@@ -406,6 +729,126 @@ class PlotterApp:
             self.apply_profile(profile_id)
             self.units_changed()
 
+    def current_signal_map(self):
+        return self.signal_maps[self.signal_map_id.get()]['signals']
+
+    def update_signal_map_choices(self):
+        self.signal_map_choices = {f'{entry["name"]} [{map_id}]': map_id
+                                   for map_id, entry in self.signal_maps.items()}
+        self.signal_map_selector.configure(values=tuple(self.signal_map_choices))
+        for label, map_id in self.signal_map_choices.items():
+            if map_id == self.signal_map_id.get():
+                self.signal_map_choice.set(label)
+                break
+
+    def choose_signal_map(self, _event=None):
+        map_id = self.signal_map_choices.get(self.signal_map_choice.get())
+        if map_id is not None:
+            self.signal_map_id.set(map_id)
+            self.units_changed()
+
+    def needed_roles(self):
+        """Mapped quantities that the current figure and detector actually read."""
+        roles = {}
+        for trace in self.current_traces():
+            if trace['id'] not in self.preset_disabled:
+                roles.update(dict.fromkeys(trace.get('roles', ())))
+        if self.detector.get() == 'references':
+            roles.update(dict.fromkeys(REFERENCE_ROLES))
+        order = [role for role, *_ in SIGNAL_ROLES]
+        return sorted(roles, key=order.index)
+
+    def refresh_signal_map_status(self):
+        if self.signal_catalog is None:
+            self.signal_map_status.set(self.tr('Select a measurement: the status shows whether the '
+                                               'quantities of the figure are in the recording.'))
+            return
+        roles = self.needed_roles()
+        labels = {role: self.tr(label) for role, label, *_ in SIGNAL_ROLES}
+
+        def missing(signal_map):
+            resolved = resolve_signal_map(self.signal_catalog, signal_map)
+            return [role for role in roles if resolved[role] is None]
+
+        mapping = self.current_signal_map()
+        absent = missing(mapping)
+        parts = [self.tr('{name}: {found}/{total} quantities of the figure found.',
+                         name=self.signal_catalog_name, found=len(roles) - len(absent), total=len(roles))]
+        if absent:
+            parts.append(self.tr('Missing: {items}.', items='; '.join(
+                f'{labels[role]} ({" / ".join(mapping[role]) or self.tr("not linked")})' for role in absent)))
+            better = min(((len(missing(entry['signals'])), entry['name'])
+                          for map_id, entry in self.signal_maps.items()
+                          if map_id != self.signal_map_id.get()), default=None)
+            if better is not None and better[0] < len(absent):
+                parts.append(self.tr('Profile "{name}" matches better ({count} missing).',
+                                     name=better[1], count=better[0]))
+        if self.scene_kind() in ('custom', 'configured'):
+            parts.append(self.tr('Recording keys are used directly; @quantities follow the signal map.'))
+        self.signal_map_status.set(' '.join(parts))
+
+    def show_signal_listing(self):
+        """Window listing every signal of the active recording with its range and block path."""
+        if self.signal_catalog is None:
+            self.status.set(self.tr('Select a measurement first.'))
+            return
+        if self.listing_window is not None and self.listing_window.winfo_exists():
+            self.listing_window.destroy()
+        name = self.signal_catalog_name
+        text = signal_listing(self.signal_catalog, name, self.tr)
+        window = self.listing_window = tk.Toplevel(self.root)
+        window.title(self.tr('Signals — {name}', name=name))
+        frame = ttk.Frame(window)
+        frame.pack(fill=tk.BOTH, expand=True)
+        widget = tk.Text(frame, wrap='none', font='TkFixedFont', width=140, height=40)
+        vertical = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=widget.yview)
+        horizontal = ttk.Scrollbar(frame, orient=tk.HORIZONTAL, command=widget.xview)
+        widget.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        widget.grid(row=0, column=0, sticky='nsew')
+        vertical.grid(row=0, column=1, sticky='ns')
+        horizontal.grid(row=1, column=0, sticky='ew')
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        widget.insert('1.0', text)
+        widget.configure(state='disabled')  # read-only, but text can still be selected and copied
+        buttons = ttk.Frame(window, padding=6)
+        buttons.pack(fill=tk.X)
+        ttk.Button(buttons, text=self.tr('Save as text…'),
+                   command=lambda: self.save_signal_listing(text, window)).pack(side=tk.LEFT)
+        ttk.Button(buttons, text=self.tr('Close'), command=window.destroy).pack(side=tk.RIGHT)
+
+    def save_signal_listing(self, text, parent):
+        source = self.signal_catalog_path
+        target = filedialog.asksaveasfilename(
+            parent=parent, defaultextension='.txt', filetypes=[(self.tr('Text files'), '*.txt')],
+            initialdir=str(source.parent) if source else None,
+            initialfile=f'{Path(self.signal_catalog_name).stem}_signals.txt')
+        if not target:
+            return
+        try:
+            Path(target).write_text(text, encoding='utf-8')
+        except OSError as error:
+            messagebox.showerror(self.tr('Saving failed'), str(error), parent=parent)
+            return
+        self.status.set(self.tr('Signal list saved: {path}', path=target))
+
+    def edit_signal_map(self):
+        if self.map_dialog is not None and self.map_dialog.window.winfo_exists():
+            self.map_dialog.window.lift()
+            return
+        self.map_dialog = SignalMapDialog(self)
+
+    def signal_map_saved(self, map_id):
+        """Use a profile just written by this application without a full reload."""
+        self.signal_maps = load_signal_maps()
+        if self._config_stamps is not None:
+            self._config_stamps = (*self._config_stamps[:2], self.config_stamps()[2])
+        self.signal_map_id.set(map_id)
+        self.update_signal_map_choices()
+        self.status.set(self.tr('Signal map "{name}" saved: {file}.',
+                                name=self.signal_maps[map_id]['name'], file=SIGNAL_MAP_PATH.name))
+        self.units_changed()
+
     @staticmethod
     def config_stamps():
         def stamp(path):
@@ -414,7 +857,7 @@ class PlotterApp:
                 return stat.st_mtime_ns, stat.st_size
             except OSError:
                 return None
-        return stamp(SCENARIO_PATH), stamp(MOTOR_PATH)
+        return stamp(SCENARIO_PATH), stamp(MOTOR_PATH), stamp(SIGNAL_MAP_PATH)
 
     def poll_configuration(self):
         if self.closing:
@@ -426,17 +869,18 @@ class PlotterApp:
 
     def reload_configuration(self, automatic=False):
         if self.busy or self.batch_active:
-            self.status.set('Asetukset ladataan vasta käynnissä olevan työn jälkeen.')
+            self.status.set(self.tr('Settings will be reloaded after the running job.'))
             return
         stamps = self.config_stamps()
         try:
             scenarios = load_scenarios()
             profiles = load_motor_profiles()
+            signal_maps = load_signal_maps()
         except ValueError as error:
             self._failed_config_stamps = stamps
-            self.status.set(f'Asetustiedoston virhe; aiemmat asetukset säilytetty: {error}')
+            self.status.set(self.tr('Configuration file error; previous settings kept: {error}', error=error))
             if not automatic:
-                messagebox.showerror('Asetustiedoston virhe', str(error), parent=self.root)
+                messagebox.showerror(self.tr('Configuration file error'), str(error), parent=self.root)
             return
         old_scenarios = self.scenarios
         changed = {key for key in set(old_scenarios) | set(scenarios)
@@ -464,14 +908,22 @@ class PlotterApp:
         profile_changed = old_profile != profiles[selected]
         if profile_changed and not dirty:
             self.apply_profile(selected)
+        old_map = self.signal_maps.get(self.signal_map_id.get())
+        self.signal_maps = signal_maps
+        if self.signal_map_id.get() not in signal_maps:
+            self.signal_map_id.set(next(iter(signal_maps)))
+        self.update_signal_map_choices()
+        map_changed = old_map != signal_maps[self.signal_map_id.get()]
         self._config_stamps = stamps
         self._failed_config_stamps = None
         self.refresh_groups(switch_to_custom=False)
-        self.status.set('Asetukset päivitetty.' +
-                        (' Muokatut moottoriarvot säilytettiin; valitse profiili uudelleen päivittääksesi ne.'
-                         if profile_changed and dirty else '') +
-                        (' Muuttuneiden skenaarioiden istuntokohtaiset muokkaukset nollattiin.' if changed else ''))
-        if (changed or (profile_changed and not dirty)) and self.figure is not None:
+        parts = [self.tr('Settings updated.')]
+        if profile_changed and dirty:
+            parts.append(self.tr('Edited motor values were kept; select the profile again to update them.'))
+        if changed:
+            parts.append(self.tr('Session edits of changed scenarios were reset.'))
+        self.status.set(' '.join(parts))
+        if (changed or map_changed or (profile_changed and not dirty)) and self.figure is not None:
             self.preview()
 
     def _build(self):
@@ -497,17 +949,26 @@ class PlotterApp:
         preview_label.pack(side=tk.TOP, fill=tk.X)
         self.plot_area.bind('<Configure>', lambda event: preview_label.configure(
             wraplength=max(200, event.width - 12)))
+        language_row = ttk.Frame(sidebar)
+        language_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(language_row, text='Kieli / Language').pack(side=tk.LEFT)
+        self.language_choice = tk.StringVar(value=LANGUAGES[self.language])
+        language_box = ttk.Combobox(language_row, textvariable=self.language_choice,
+                                    values=tuple(LANGUAGES.values()), state='readonly', width=10)
+        language_box.pack(side=tk.LEFT, padx=4)
+        language_box.bind('<<ComboboxSelected>>', self.choose_language)
         buttons = ttk.Frame(sidebar)
         buttons.pack(fill=tk.X)
-        for label, command in [('Tiedostot…', self.add_files), ('Kansio…', self.add_folder),
-                               ('Poista', self.remove_files)]:
-            ttk.Button(buttons, text=label, command=command).pack(side=tk.LEFT)
-        ttk.Label(sidebar, text='Ctrl/Shift: monivalinta; Ctrl+A: kaikki; aktiivinen rivi esikatseluun').pack(anchor=tk.W)
+        for label, command in [('Files…', self.add_files), ('Folder…', self.add_folder),
+                               ('Remove', self.remove_files)]:
+            self._t(ttk.Button(buttons, command=command), label).pack(side=tk.LEFT)
+        self._t(ttk.Label(sidebar),
+                'Ctrl/Shift: multiple selection; Ctrl+A: all; the active row is previewed').pack(anchor=tk.W)
         frame = ttk.Frame(sidebar)
         frame.pack(fill=tk.X)
         self.files = ttk.Treeview(frame, columns=('state',), height=7, selectmode='extended')
-        self.files.heading('#0', text='Mittaus')
-        self.files.heading('state', text='Tila')
+        self._heading(self.files, '#0', 'Measurement')
+        self._heading(self.files, 'state', 'State')
         self.files.column('#0', width=290)
         self.files.column('state', width=100)
         self.files.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -519,95 +980,105 @@ class PlotterApp:
         self.file_label = ttk.Label(sidebar, text='', wraplength=400)
         self.file_label.pack(anchor=tk.W)
 
-        settings = ttk.LabelFrame(sidebar, text='Kuva ja aikaikkuna', padding=5)
+        settings = self._t(ttk.LabelFrame(sidebar, padding=5), 'Figure and time window')
         settings.pack(fill=tk.X, pady=5)
         self.kind_selector = ttk.Combobox(settings, textvariable=self.scenario_choice, state='readonly')
         self.kind_selector.grid(row=0, column=0, columnspan=2, sticky='ew')
         self.kind_selector.bind('<<ComboboxSelected>>', self.choose_scenario)
         self.update_scenario_choices()
         for row, (key, label, value) in enumerate([
-                ('pre', 'Ennen transienttia (s)', '.2'),
-                ('post', 'Viimeisen transientin jälkeen (s)', '.2'),
-                ('duration', 'Pituus (s), tyhjä = automaattinen', ''),
-                ('x_step', 'X pääjako (s), tyhjä = oletus', ''),
-                ('x_minor_step', 'X apujako (s), tyhjä = oletus', ''),
-                ('offset', 'Nollakohta (s), tyhjä = autom.', '')], 1):
+                ('pre', 'Before transient (s)', '.2'),
+                ('post', 'After last transient (s)', '.2'),
+                ('duration', 'Duration (s), empty = automatic', ''),
+                ('x_step', 'X major step (s), empty = default', ''),
+                ('x_minor_step', 'X minor step (s), empty = default', ''),
+                ('offset', 'Time origin (s), empty = automatic', '')], 1):
             self.parameters[key] = tk.StringVar(value=value)
-            ttk.Label(settings, text=label).grid(row=row, column=0, sticky='w')
+            self._t(ttk.Label(settings), label).grid(row=row, column=0, sticky='w')
             ttk.Entry(settings, textvariable=self.parameters[key], width=12).grid(row=row, column=1)
-        ttk.Checkbutton(settings, text='Käytä p.u.-arvoja (kaikki kuvat)',
-                        variable=self.per_unit, command=self.units_changed).grid(
-                            row=7, column=0, columnspan=2, sticky='w')
-        ttk.Checkbutton(settings, text='Näytä apuruudukko (minor grid)',
-                        variable=self.minor_grid, command=self.minor_grid_changed).grid(
-                            row=8, column=0, columnspan=2, sticky='w')
-        ttk.Label(settings, text='Kulmat säilyvät deg/rad-yksiköissä.').grid(
-            row=9, column=0, columnspan=2, sticky='w')
-        ttk.Label(settings, text='Palstat (custom / asetusskenaario)').grid(row=10, column=0, sticky='w')
+        self._t(ttk.Checkbutton(settings, variable=self.per_unit, command=self.units_changed),
+                'Use p.u. values (all figures)').grid(row=7, column=0, columnspan=2, sticky='w')
+        self._t(ttk.Checkbutton(settings, variable=self.minor_grid, command=self.minor_grid_changed),
+                'Show minor grid').grid(row=8, column=0, columnspan=2, sticky='w')
+        self._t(ttk.Label(settings), 'Angles stay in deg/rad.').grid(row=9, column=0, columnspan=2, sticky='w')
+        self._t(ttk.Label(settings), 'Columns (custom / configured scenario)').grid(row=10, column=0, sticky='w')
         self.columns_entry = ttk.Entry(settings, textvariable=self.columns, width=12)
         self.columns_entry.grid(row=10, column=1)
-        ttk.Button(settings, text='Lataa asetukset uudelleen', command=self.reload_configuration).grid(
+        self._t(ttk.Button(settings, command=self.reload_configuration), 'Reload settings').grid(
             row=11, column=0, columnspan=2, sticky='w')
-        appearance = ttk.LabelFrame(sidebar, text='Ulkoasu ja väripaletti', padding=5)
+        appearance = self._t(ttk.LabelFrame(sidebar, padding=5), 'Appearance and palette')
         appearance.pack(fill=tk.X, pady=5)
-        ttk.Label(appearance, text='Tyyli').grid(row=0, column=0, sticky='w')
+        self._t(ttk.Label(appearance), 'Style').grid(row=0, column=0, sticky='w')
         style_box = ttk.Combobox(appearance, textvariable=self.style,
                                  values=('screen', 'latex_style'), state='readonly', width=18)
         style_box.grid(row=0, column=1)
         style_box.bind('<<ComboboxSelected>>', self.style_changed)
-        ttk.Label(appearance, text='Paletti').grid(row=1, column=0, sticky='w')
+        self._t(ttk.Label(appearance), 'Palette').grid(row=1, column=0, sticky='w')
         palette_box = ttk.Combobox(appearance, textvariable=self.palette,
                                    values=tuple(PALETTES), state='readonly', width=18)
         palette_box.grid(row=1, column=1)
         palette_box.bind('<<ComboboxSelected>>', lambda _event: self.units_changed())
-        ttk.Label(appearance, text='latex_style käyttää vanhaa julkaisutyyliä; vaatii TeX-asennuksen '
-                  'ja newtx-paketit. Paletti valitaan erikseen.', wraplength=430).grid(
-                      row=2, column=0, columnspan=2, sticky='w')
-        detection = ttk.LabelFrame(sidebar, text='Transienttitunnistus', padding=5)
+        self._t(ttk.Label(appearance, wraplength=430),
+                'latex_style uses the legacy publication style; it needs a TeX installation and the newtx '
+                'packages. The palette is chosen separately.').grid(row=2, column=0, columnspan=2, sticky='w')
+        detection = self._t(ttk.LabelFrame(sidebar, padding=5), 'Transient detection')
         detection.pack(fill=tk.X, pady=5)
         detector_box = ttk.Combobox(detection, textvariable=self.detector,
                                     values=('references', 'spikes'), state='readonly', width=20)
         detector_box.grid(row=0, column=0, columnspan=2, sticky='ew')
         detector_box.bind('<<ComboboxSelected>>', lambda _event: self.units_changed())
-        ttk.Label(detection, text='Piikkisignaali').grid(row=1, column=0, sticky='w')
+        self._t(ttk.Label(detection), 'Spike signal').grid(row=1, column=0, sticky='w')
         self.spike_selector = ttk.Combobox(detection, textvariable=self.spike_signal,
-                                           values=(), state='readonly', width=30)
+                                           values=self.scalar_role_keys(), state='readonly', width=30)
         self.spike_selector.grid(row=1, column=1)
-        ttk.Label(detection, text='Amplitudikynnys (raakayksikkö)').grid(row=2, column=0, sticky='w')
+        self._t(ttk.Label(detection), 'Amplitude threshold (raw units)').grid(row=2, column=0, sticky='w')
         ttk.Entry(detection, textvariable=self.spike_threshold, width=12).grid(row=2, column=1)
-        ttk.Label(detection, text='references: wm_ref- ja tauLref/TL_ref-ohjeiden muutokset. '
-                  'spikes: |y − koko signaalin mediaani| > kynnys valitussa mittaussignaalissa. '
-                  'Tunnistus käyttää alkuperäistä dataa, ei p.u.-muunnoksia. Ei tapahtumia → koko tallenne.',
-                  wraplength=430).grid(row=3, column=0, columnspan=2, sticky='w')
-        motor = ttk.LabelFrame(sidebar, text='Moottori — samat arvot kaikille valituille', padding=5)
+        self._t(ttk.Label(detection, wraplength=430),
+                'references: changes of the linked speed and load-torque references (default wm_ref, '
+                'tauLref/TL_ref). spikes: |y − median of the whole signal| > threshold in the selected signal '
+                '(also an @quantity). Detection uses the original data, not p.u. conversions. '
+                'No events → whole recording.').grid(row=3, column=0, columnspan=2, sticky='w')
+        motor = self._t(ttk.LabelFrame(sidebar, padding=5), 'Motor — same values for all selected files')
         motor.pack(fill=tk.X)
-        ttk.Label(motor, text='Moottoriprofiili').grid(row=0, column=0, sticky='w')
+        self._t(ttk.Label(motor), 'Motor profile').grid(row=0, column=0, sticky='w')
         self.profile_choice = tk.StringVar()
         self.profile_selector = ttk.Combobox(motor, textvariable=self.profile_choice,
                                              state='readonly', width=23)
         self.profile_selector.grid(row=0, column=1, columnspan=2, sticky='ew')
         self.profile_selector.bind('<<ComboboxSelected>>', self.choose_profile)
         profile = self.motor_profiles[self.profile_id.get()]
-        labels = [('U_nom', 'U RMS, pääjännite (V)'), ('I_nom', 'I RMS (A)'),
+        labels = [('U_nom', 'U RMS, line-to-line (V)'), ('I_nom', 'I RMS (A)'),
                   ('f_nom', 'f (Hz)'), ('P_nom', 'P (W)'),
-                  ('tau_nom', 'T nimellinen (Nm)'), ('n_p', 'Napaparit')]
+                  ('tau_nom', 'T rated (Nm)'), ('n_p', 'Pole pairs')]
         for index, (key, label) in enumerate(labels):
             self.parameters[key] = tk.StringVar(value=str(profile[key]))
             row, col = divmod(index, 3)
-            ttk.Label(motor, text=label).grid(row=1 + row*2, column=col)
+            self._t(ttk.Label(motor), label).grid(row=1 + row*2, column=col)
             ttk.Entry(motor, textvariable=self.parameters[key], width=12).grid(row=2 + row*2, column=col)
         self.profile_baseline = {key: self.parameters[key].get() for key, _ in labels}
         self.update_profile_choices()
-        ttk.Label(motor, text='Momentin esitystapa').grid(row=5, column=0, sticky='w')
+        self._t(ttk.Label(motor), 'Torque display').grid(row=5, column=0, sticky='w')
         torque_selector = ttk.Combobox(motor, textvariable=self.torque_mode,
                                       values=('per_unit', 'rated'), state='readonly', width=12)
         torque_selector.grid(row=5, column=1, sticky='w')
         torque_selector.bind('<<ComboboxSelected>>', self.torque_mode_changed)
-        ttk.Label(motor, text='rated: momentit / moottoriprofiilin nimellismomentti; '
-                  'muut suureet noudattavat p.u.-valintaa.', wraplength=430).grid(
-                      row=6, column=0, columnspan=3, sticky='w')
+        self._t(ttk.Label(motor, wraplength=430),
+                'rated: torques / nominal torque of the motor profile; other quantities follow the p.u. '
+                'choice.').grid(row=6, column=0, columnspan=3, sticky='w')
+        links = self._t(ttk.LabelFrame(sidebar, padding=5), 'Signal links (dSPACE model)')
+        links.pack(fill=tk.X, pady=5)
+        self._t(ttk.Label(links), 'Signal map').grid(row=0, column=0, sticky='w')
+        self.signal_map_selector = ttk.Combobox(links, textvariable=self.signal_map_choice,
+                                                state='readonly', width=30)
+        self.signal_map_selector.grid(row=0, column=1, sticky='ew')
+        self.signal_map_selector.bind('<<ComboboxSelected>>', self.choose_signal_map)
+        self.update_signal_map_choices()
+        self._t(ttk.Button(links, command=self.edit_signal_map), 'Edit links…').grid(
+            row=1, column=0, columnspan=2, sticky='w')
+        ttk.Label(links, textvariable=self.signal_map_status, wraplength=430).grid(
+            row=2, column=0, columnspan=2, sticky='w')
 
-        custom = ttk.LabelFrame(sidebar, text='Mittaussignaalit / custom-alikuvaajat', padding=5)
+        custom = self._t(ttk.LabelFrame(sidebar, padding=5), 'Measured signals / custom subplots')
         custom.pack(fill=tk.BOTH, expand=True, pady=5)
         ttk.Entry(custom, textvariable=self.search).pack(fill=tk.X)
         self.search.trace_add('write', lambda *_: self.filter_signals())
@@ -619,33 +1090,36 @@ class PlotterApp:
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.signals.configure(yscrollcommand=scroll.set)
         self.signals.bind('<<ListboxSelect>>', self.unit_selection_changed)
+        self.listed_keys = []
         unit_row = ttk.Frame(custom)
         unit_row.pack(fill=tk.X)
-        ttk.Label(unit_row, text='Tallennetun signaalin yksikkö:').pack(side=tk.LEFT)
+        self._t(ttk.Label(unit_row), 'Unit of the recorded signal:').pack(side=tk.LEFT)
         ttk.Combobox(unit_row, textvariable=self.input_unit, values=SIGNAL_UNITS,
                      state='readonly', width=14).pack(side=tk.LEFT)
-        ttk.Button(unit_row, text='Aseta valituille', command=self.assign_units).pack(side=tk.LEFT)
+        self._t(ttk.Button(unit_row, command=self.assign_units), 'Set for selected').pack(side=tk.LEFT)
+        self._t(ttk.Button(custom, command=self.show_signal_listing), 'List all signals…').pack(anchor=tk.W)
         action = ttk.Frame(custom)
         action.pack(fill=tk.X)
-        for label, command in [('Lisää alikuvaaja', self.add_group),
-                               ('Korvaa valittu', self.replace_group),
-                               ('Poista alikuvaaja', self.remove_group)]:
-            ttk.Button(action, text=label, command=command).pack(side=tk.LEFT)
+        for label, command in [('Add subplot', self.add_group),
+                               ('Replace selected', self.replace_group),
+                               ('Remove subplot', self.remove_group)]:
+            self._t(ttk.Button(action, command=command), label).pack(side=tk.LEFT)
         self.group_list = tk.Listbox(custom, height=4, exportselection=False)
         self.group_list.pack(fill=tk.X)
-        ttk.Label(custom, text='Ctrl/Shift: useita signaaleja samalle akselille. raw = ei muunnosta; '
-                  'p.u. (Nm) ym. = jo normalisoitu syöte. Valitse ensin syötteen yksikkö ja paina Aseta valituille.',
-                  wraplength=420).pack(anchor=tk.W)
-        editor = ttk.LabelFrame(sidebar, text='Alikuvaajien signaalit ja laskutoimitukset', padding=5)
+        self._t(ttk.Label(custom, wraplength=420),
+                'Ctrl/Shift: several signals on the same axis. @quantities at the top follow the signal map '
+                'and work across dSPACE models. raw = no conversion; p.u. (Nm) etc. = already normalized '
+                'input. Select the input unit first and press Set for selected.').pack(anchor=tk.W)
+        editor = self._t(ttk.LabelFrame(sidebar, padding=5), 'Subplot signals and calculations')
         editor.pack(fill=tk.X, pady=5)
         tree_frame = ttk.Frame(editor)
         tree_frame.pack(fill=tk.X)
         self.trace_tree = ttk.Treeview(tree_frame, columns=('stage', 'scale', 'offset'),
                                       selectmode='browse', height=9)
-        self.trace_tree.heading('#0', text='Alikuvaaja / signaalilähde')
-        self.trace_tree.heading('stage', text='Nykyinen johdettu käsittely')
-        self.trace_tree.heading('scale', text='Kerroin')
-        self.trace_tree.heading('offset', text='Lisäys')
+        self._heading(self.trace_tree, '#0', 'Subplot / signal source')
+        self._heading(self.trace_tree, 'stage', 'Current derived processing')
+        self._heading(self.trace_tree, 'scale', 'Gain')
+        self._heading(self.trace_tree, 'offset', 'Offset')
         self.trace_tree.column('#0', width=210)
         self.trace_tree.column('stage', width=250)
         self.trace_tree.column('scale', width=90)
@@ -660,15 +1134,14 @@ class PlotterApp:
         self.trace_tree.bind('<<TreeviewSelect>>', self.trace_selected)
         signal_actions = ttk.Frame(editor)
         signal_actions.pack(fill=tk.X)
-        ttk.Button(signal_actions, text='Lisää valitut signaalit',
-                   command=self.add_preset_signals).pack(side=tk.LEFT)
-        ttk.Button(signal_actions, text='Poista / palauta signaali',
-                   command=self.toggle_preset_signal).pack(side=tk.LEFT)
-        ttk.Button(signal_actions, text='Palauta signaalit',
-                   command=self.reset_preset_signals).pack(side=tk.LEFT)
-        ttk.Label(editor, text='Esiasetus: valitse tästä kohdealikuvaaja sekä yllä mittaussignaalit ja '
-                  'niiden syöttöyksiköt. Piilotetun alkuperäisen voi palauttaa samalla painikkeella. '
-                  'Lisätyt signaalit käyttävät tallenteen omaa aikarasteria.', wraplength=430).pack(anchor=tk.W)
+        for label, command in [('Add selected signals', self.add_preset_signals),
+                               ('Remove / restore signal', self.toggle_preset_signal),
+                               ('Restore signals', self.reset_preset_signals)]:
+            self._t(ttk.Button(signal_actions, command=command), label).pack(side=tk.LEFT)
+        self._t(ttk.Label(editor, wraplength=430),
+                'Preset: select the target subplot here and the recorded signals and their input units above. '
+                'A hidden original can be restored with the same button. Added signals use their own time '
+                'raster.').pack(anchor=tk.W)
         ttk.Label(editor, textvariable=self.trace_detail, wraplength=430).pack(anchor=tk.W)
         y_row = ttk.Frame(editor)
         y_row.pack(fill=tk.X)
@@ -678,55 +1151,58 @@ class PlotterApp:
         ttk.Entry(y_row, textvariable=self.y_max, width=12).pack(side=tk.LEFT)
         y_buttons = ttk.Frame(editor)
         y_buttons.pack(fill=tk.X)
-        ttk.Button(y_buttons, text='Aseta Y-rajat', command=self.assign_y_limits).pack(side=tk.LEFT)
-        ttk.Button(y_buttons, text='Oletusrajat', command=self.reset_y_limits).pack(side=tk.LEFT)
-        ttk.Label(editor, text='Valitse alikuvaaja tai sen signaali. Tyhjä raja = oletus/autom. '
-                  'Rajojen luvut ovat näkyvissä yksiköissä; p.u.-vaihto ei muunna syötettyjä lukuja.',
-                  wraplength=430).pack(anchor=tk.W)
+        self._t(ttk.Button(y_buttons, command=self.assign_y_limits), 'Set Y limits').pack(side=tk.LEFT)
+        self._t(ttk.Button(y_buttons, command=self.reset_y_limits), 'Default limits').pack(side=tk.LEFT)
+        self._t(ttk.Label(editor, wraplength=430),
+                'Select a subplot or its signal. Empty limit = default/automatic. Limits are in displayed '
+                'units; switching p.u. does not convert the entered numbers.').pack(anchor=tk.W)
         ticks_row = ttk.Frame(editor)
         ticks_row.pack(fill=tk.X)
-        ttk.Label(ticks_row, text='Y pääjako').pack(side=tk.LEFT)
+        self._t(ttk.Label(ticks_row), 'Y major step').pack(side=tk.LEFT)
         ttk.Entry(ticks_row, textvariable=self.y_major_step, width=10).pack(side=tk.LEFT)
-        ttk.Label(ticks_row, text='Y apujako').pack(side=tk.LEFT)
+        self._t(ttk.Label(ticks_row), 'Y minor step').pack(side=tk.LEFT)
         ttk.Entry(ticks_row, textvariable=self.y_minor_step, width=10).pack(side=tk.LEFT)
         ticks_buttons = ttk.Frame(editor)
         ticks_buttons.pack(fill=tk.X)
-        ttk.Button(ticks_buttons, text='Aseta Y-jaot', command=self.assign_y_ticks).pack(side=tk.LEFT)
-        ttk.Button(ticks_buttons, text='Palauta Y-jaot', command=self.reset_y_ticks).pack(side=tk.LEFT)
-        ttk.Label(editor, text='Jaot ovat näkyvissä yksiköissä. Tyhjä = oletus; '
-                  'p.u.-vaihto ei muunna asetettuja jakoja.', wraplength=430).pack(anchor=tk.W)
+        self._t(ttk.Button(ticks_buttons, command=self.assign_y_ticks), 'Set Y steps').pack(side=tk.LEFT)
+        self._t(ttk.Button(ticks_buttons, command=self.reset_y_ticks), 'Restore Y steps').pack(side=tk.LEFT)
+        self._t(ttk.Label(editor, wraplength=430),
+                'Steps are in displayed units. Empty = default; switching p.u. does not convert the set '
+                'steps.').pack(anchor=tk.W)
         edit_row = ttk.Frame(editor)
         edit_row.pack(fill=tk.X)
-        ttk.Label(edit_row, text='Kerroin').pack(side=tk.LEFT)
+        self._t(ttk.Label(edit_row), 'Gain').pack(side=tk.LEFT)
         ttk.Entry(edit_row, textvariable=self.edit_scale, width=14).pack(side=tk.LEFT)
-        ttk.Label(edit_row, text='Lisäys').pack(side=tk.LEFT)
+        self._t(ttk.Label(edit_row), 'Offset').pack(side=tk.LEFT)
         ttk.Entry(edit_row, textvariable=self.edit_offset, width=14).pack(side=tk.LEFT)
         edit_buttons = ttk.Frame(editor)
         edit_buttons.pack(fill=tk.X)
-        ttk.Button(edit_buttons, text='Aseta muunnos', command=self.assign_transform).pack(side=tk.LEFT)
-        ttk.Button(edit_buttons, text='Palauta valittu oletukseen', command=self.reset_transform).pack(side=tk.LEFT)
-        ttk.Label(editor, text='y → kerroin × y + lisäys ennen p.u.-muunnosta. '
-                  'Mekaaninen → sähköinen nopeus: kerroin n_p (korvaa nykyisen kertoimen). '
-                  'Sallittu esim. 1/n_p, 2*n_p, -1, i_base. Muokatun akselin y-rajaus on automaattinen.',
-                  wraplength=430).pack(anchor=tk.W)
+        self._t(ttk.Button(edit_buttons, command=self.assign_transform), 'Set transform').pack(side=tk.LEFT)
+        self._t(ttk.Button(edit_buttons, command=self.reset_transform),
+                'Reset selected to default').pack(side=tk.LEFT)
+        self._t(ttk.Label(editor, wraplength=430),
+                'y → gain × y + offset before p.u. conversion. Mechanical → electrical speed: gain n_p '
+                '(replaces the current gain). Allowed e.g. 1/n_p, 2*n_p, -1, i_base. The edited axis is '
+                'autoscaled.').pack(anchor=tk.W)
         self.refresh_trace_editor()
-        export = ttk.LabelFrame(sidebar, text='PDF-tallennus', padding=5)
+        export = self._t(ttk.LabelFrame(sidebar, padding=5), 'PDF export')
         export.pack(fill=tk.X)
-        ttk.Label(export, text='Tyhjä = kunkin mittauksen lähdekansio').pack(anchor=tk.W)
+        self._t(ttk.Label(export), 'Empty = source folder of each measurement').pack(anchor=tk.W)
         ttk.Entry(export, textvariable=self.output).pack(fill=tk.X)
-        ttk.Button(export, text='Tallennuskansio…', command=self.choose_output).pack(side=tk.LEFT)
-        ttk.Button(export, text='Lähdekansio', command=lambda: self.output.set('')).pack(side=tk.LEFT)
+        self._t(ttk.Button(export, command=self.choose_output), 'Output folder…').pack(side=tk.LEFT)
+        self._t(ttk.Button(export, command=lambda: self.output.set('')), 'Source folder').pack(side=tk.LEFT)
         actions = ttk.Frame(sidebar)
         actions.pack(fill=tk.X, pady=5)
-        self.preview_button = ttk.Button(actions, text='Esikatsele', command=self.preview)
+        self.preview_button = self._t(ttk.Button(actions, command=self.preview), 'Preview')
         self.preview_button.pack(side=tk.LEFT)
-        self.export_button = ttk.Button(actions, text='Tallenna valitut PDF', command=self.export)
+        self.export_button = self._t(ttk.Button(actions, command=self.export), 'Save selected as PDF')
         self.export_button.pack(side=tk.LEFT)
-        ttk.Button(actions, text='Keskeytä eräajo', command=self.cancel).pack(side=tk.LEFT)
-        ttk.Button(sidebar, text='Palauta tämän kuvatyypin legendit',
-                   command=self.reset_legends).pack(anchor=tk.W)
-        ttk.Label(sidebar, text='Raahaa legendoja esikatselussa (zoom/siirto pois). '
-                  'Sijainnit säilyvät tämän istunnon PDF-eräajossa.', wraplength=430).pack(anchor=tk.W)
+        self._t(ttk.Button(actions, command=self.cancel), 'Cancel batch').pack(side=tk.LEFT)
+        self._t(ttk.Button(sidebar, command=self.reset_legends),
+                'Reset legends of this figure type').pack(anchor=tk.W)
+        self._t(ttk.Label(sidebar, wraplength=430),
+                "Drag legends in the preview (zoom/pan off). Positions are kept in this session's PDF "
+                'batches.').pack(anchor=tk.W)
         ttk.Label(self.root, textvariable=self.status, anchor=tk.W, padding=5).pack(fill=tk.X)
 
     def select_all(self, _event=None):
@@ -745,7 +1221,8 @@ class PlotterApp:
         first = None
         for path in sorted({Path(p).resolve() for p in paths}, key=lambda p: str(p).casefold()):
             if path not in self.path_ids.values():
-                item = self.files.insert('', tk.END, text=path.name, values=('Lisätty',))
+                item = self.files.insert('', tk.END, text=path.name)
+                self.set_file_state(item, 'Added')
                 self.path_ids[item] = path
                 first = first or item
         if first:
@@ -753,7 +1230,8 @@ class PlotterApp:
             self.files.focus(first)
 
     def add_files(self):
-        paths = filedialog.askopenfilenames(filetypes=[('MAT-mittaukset', '*.mat *.MAT'), ('Kaikki', '*.*')])
+        paths = filedialog.askopenfilenames(filetypes=[(self.tr('MAT measurements'), '*.mat *.MAT'),
+                                                       (self.tr('All files'), '*.*')])
         self.insert_paths(paths)
 
     def add_folder(self):
@@ -766,9 +1244,12 @@ class PlotterApp:
             return
         for item in self.files.selection():
             del self.path_ids[item]
+            self.file_states.pop(item, None)
             self.files.delete(item)
         self.signal_keys = []
+        self.signal_catalog = None
         self.filter_signals()
+        self.refresh_signal_map_status()
 
     def choose_output(self):
         folder = filedialog.askdirectory()
@@ -783,48 +1264,79 @@ class PlotterApp:
 
         def read_keys():
             with LabDataMat(path) as data:
-                return data.keys()
+                return data.catalog()
 
-        def loaded(keys):
+        def loaded(catalog):
             if self.active_path() == path:
+                keys = catalog.keys()
                 self.signal_keys = keys
-                self.spike_selector.configure(values=keys)
+                self.signal_catalog = catalog
+                self.signal_catalog_name = path.name
+                self.signal_catalog_path = path
+                self.spike_selector.configure(values=[*self.scalar_role_keys(), *keys])
                 self.filter_signals()
-                self.status.set(f'{path.name}: {len(keys)} signaalia. Valitse kuva tai kokoa alikuvaajat.')
+                self.refresh_signal_map_status()
+                if self.map_dialog is not None and self.map_dialog.window.winfo_exists():
+                    self.map_dialog.set_catalog(catalog, path.name)
+                self.status.set(self.tr('{name}: {count} signals. Select a figure or build subplots.',
+                                        name=path.name, count=len(keys)))
             else:
                 self.selection_changed()
         self.start_job(read_keys, loaded)
 
+    @staticmethod
+    def scalar_role_keys():
+        return [f'@{role}' for role, *_ in SIGNAL_ROLES if role not in VECTOR_ROLES]
+
+    def signal_entries(self):
+        """(key, shown text, search text) of the @quantities and then the recording keys."""
+        resolved = (resolve_signal_map(self.signal_catalog, self.current_signal_map())
+                    if self.signal_catalog is not None else {})
+        entries = []
+        for role, label, *_ in SIGNAL_ROLES:
+            key = f'@{role}'
+            text = key if self.signal_catalog is None else f'{key} → {resolved[role] or "✗"}'
+            entries.append((key, text, f'{text} {self.tr(label)}'))
+        return entries + [(key, key, key) for key in self.signal_keys]
+
+    def selected_signal_keys(self):
+        return [self.listed_keys[index] for index in self.signals.curselection()]
+
     def filter_signals(self):
-        selected = {self.signals.get(index) for index in self.signals.curselection()}
+        selected = set(self.selected_signal_keys())
         self.signals.delete(0, tk.END)
+        self.listed_keys = []
         query = self.search.get().casefold()
-        for key in self.signal_keys:
-            if query in key.casefold():
-                self.signals.insert(tk.END, key)
+        for key, text, searched in self.signal_entries():
+            if query in searched.casefold():
+                self.signals.insert(tk.END, text)
+                self.listed_keys.append(key)
                 if key in selected:
                     self.signals.selection_set(tk.END)
 
     def current_traces(self):
         scene_id = self.kind.get()
         kind = self.scene_kind(scene_id)
-        traces = subplot_traces('custom' if kind == 'configured' else kind, self.groups)
+        traces = subplot_traces('custom' if kind == 'configured' else kind, self.groups,
+                                self.current_signal_map(), unlinked=self.tr('({role} not linked)'))
         for trace in traces:
             native_id = trace['id']
+            trace['title'] = (self.tr('Subplot {number}', number=trace['panel'] + 1)
+                              if kind in ('custom', 'configured') else self.tr(trace['title']))
             if scene_id != kind or kind == 'configured':
                 trace['id'] = self._native_ui_id(scene_id, native_id)
             if kind == 'configured' and trace['panel'] < len(self.scene_panel_metadata[scene_id]):
                 trace['title'] = self.scene_panel_metadata[scene_id][trace['panel']]['title']
             if kind == 'hfsi' and native_id == 'hfsi:4:2' and self.torque_mode.get() == 'rated':
-                trace['stage'] = 'recorded p.u.; muunnetaan nimellismomenttiin'
+                trace['stage'] = self.tr('recorded p.u.; converted to rated torque')
                 trace['scale'] = '1'
         if kind not in ('custom', 'configured'):
             titles = {trace['panel']: trace['title'] for trace in traces}
             for added in self.preset_added[scene_id]:
                 traces.append({'id': added['id'], 'panel': added['panel'],
                                'title': titles[added['panel']], 'source': added['key'],
-                               'stage': 'lisätty, tallenteen oma aikarasteri',
-                               'scale': '1', 'offset': '0', 'divisor': ''})
+                               'stage': self.tr('added, own time raster of the recording'),
+                               'scale': '1', 'offset': '0', 'divisor': '', 'roles': ()})
         return traces
 
     def refresh_trace_editor(self, select_id=None):
@@ -842,9 +1354,10 @@ class PlotterApp:
                 parents[panel] = self.trace_tree.insert('', tk.END, iid=parent, text=trace['title'], open=True)
                 self.panel_records[parent] = {'key': f'{self.kind.get()}:{panel}', 'title': trace['title']}
             change = self.transform_overrides.get(trace['id'], trace)
-            name = trace['source'] + (' [pois]' if trace['id'] in self.preset_disabled else '')
+            name = trace['source'] + (' ' + self.tr('[off]') if trace['id'] in self.preset_disabled else '')
             self.trace_tree.insert(parents[panel], tk.END, iid=trace['id'], text=name,
                                    values=(trace['stage'], change['scale'], change['offset']))
+        self.refresh_signal_map_status()
         if select_id in self.trace_records or select_id in self.panel_records:
             self.trace_tree.selection_set(select_id)
             self.trace_selected()
@@ -853,17 +1366,17 @@ class PlotterApp:
             self.y_max.set('')
             self.y_major_step.set('')
             self.y_minor_step.set('')
-            self.trace_detail.set('Valitse alikuvaaja sen Y-rajoja varten tai signaali sen laskutoimituksia varten.')
+            self.trace_detail.set(self.tr('Select a subplot for its Y limits or a signal for its calculations.'))
 
     def add_preset_signals(self):
         kind = self.kind.get()
         panel_key = self.selected_panel_key()
         if self.scene_kind() in ('custom', 'configured') or panel_key is None:
-            self.status.set('Valitse ensin valmiin esiasetuksen kohdealikuvaaja tai sen signaali.')
+            self.status.set(self.tr('First select a target subplot of a preset, or its signal.'))
             return
-        signals = [self.signals.get(index) for index in self.signals.curselection()]
+        signals = self.selected_signal_keys()
         if not signals:
-            self.status.set('Valitse lisättävät mittaussignaalit signaaliluettelosta.')
+            self.status.set(self.tr('Select the signals to add from the signal list.'))
             return
         panel = int(panel_key.rsplit(':', 1)[1])
         added = self.preset_added[kind]
@@ -879,13 +1392,13 @@ class PlotterApp:
             self.refresh_trace_editor(new_ids[-1])
             self.units_changed()
         else:
-            self.status.set('Valitut signaalit ovat jo kyseisessä alikuvaajassa.')
+            self.status.set(self.tr('The selected signals are already in that subplot.'))
 
     def toggle_preset_signal(self):
         kind = self.kind.get()
         selected = self.trace_tree.selection()
         if self.scene_kind() in ('custom', 'configured') or not selected or selected[0] not in self.trace_records:
-            self.status.set('Valitse valmiin esiasetuksen yksittäinen signaali.')
+            self.status.set(self.tr('Select a single signal of a preset.'))
             return
         trace_id = selected[0]
         added = self.preset_added[kind]
@@ -906,7 +1419,7 @@ class PlotterApp:
     def reset_preset_signals(self):
         kind = self.kind.get()
         if self.scene_kind() in ('custom', 'configured'):
-            self.status.set('Valitse valmis esiasetus palautettavaksi.')
+            self.status.set(self.tr('Select a preset to restore.'))
             return
         self._initialize_scenarios(self.scenarios, {kind})
         self.signal_units = self.scene_signal_units[kind]
@@ -935,15 +1448,16 @@ class PlotterApp:
         self.y_major_step.set('' if steps[0] is None else str(steps[0]))
         self.y_minor_step.set('' if steps[1] is None else str(steps[1]))
         if selected[0] not in self.trace_records:
-            self.trace_detail.set(f'{self.panel_records[selected[0]]["title"]}: muokkaa Y-akselin rajoja.')
+            self.trace_detail.set(self.tr('{title}: edit the Y-axis limits.',
+                                          title=self.panel_records[selected[0]]['title']))
             return
         trace = self.trace_records[selected[0]]
         change = self.transform_overrides.get(trace['id'], trace)
         self.edit_scale.set(change['scale'])
         self.edit_offset.set(change['offset'])
-        self.trace_detail.set(f'{trace["title"]}: {trace["source"]}. '
-                              f'Johdettu käsittely: {trace["stage"] or "ei"}. '
-                              f'Oletuskerroin: {trace["scale"]}.')
+        self.trace_detail.set(self.tr('{title}: {source}. Derived processing: {stage}. Default gain: {scale}.',
+                                      title=trace['title'], source=trace['source'],
+                                      stage=trace['stage'] or self.tr('none'), scale=trace['scale']))
 
     def assign_y_limits(self):
         key = self.selected_panel_key()
@@ -953,9 +1467,9 @@ class PlotterApp:
             values = [entry.get().strip().replace(',', '.') for entry in (self.y_min, self.y_max)]
             bounds = tuple(float(value) if value else None for value in values)
             if any(value is not None and not np.isfinite(value) for value in bounds):
-                raise ValueError('Y-rajojen on oltava äärellisiä')
+                raise ValueError(self.tr('Y limits must be finite'))
             if bounds[0] is not None and bounds[1] is not None and bounds[1] <= bounds[0]:
-                raise ValueError('Y max on oltava suurempi kuin Y min')
+                raise ValueError(self.tr('Y max must be greater than Y min'))
         except ValueError as error:
             self.report_error(error)
             return
@@ -979,7 +1493,7 @@ class PlotterApp:
                       for entry in (self.y_major_step, self.y_minor_step)]
             steps = tuple(float(value) if value else None for value in values)
             if any(value is not None and (not np.isfinite(value) or value <= 0) for value in steps):
-                raise ValueError('Y-jaon on oltava positiivinen ja äärellinen')
+                raise ValueError(self.tr('Y steps must be positive and finite'))
         except ValueError as error:
             self.report_error(error)
             return
@@ -1055,10 +1569,10 @@ class PlotterApp:
             self.preview()
 
     def unit_selection_changed(self, _event=None):
-        selected = self.signals.curselection()
+        selected = self.selected_signal_keys()
         if selected:
-            key = self.signals.get(selected[0])
-            unit = self.scenarios.get(self.kind.get(), {}).get('units', {}).get(key, 'raw')
+            key = selected[0]
+            unit = self.scenarios.get(self.kind.get(), {}).get('units', {}).get(key, role_unit(key))
             if self.scene_kind() == 'configured':
                 panel_key = self.selected_panel_key()
                 panels = self.scene_panel_metadata[self.kind.get()]
@@ -1073,22 +1587,22 @@ class PlotterApp:
 
     def assign_units(self):
         unit = self.input_unit.get()
-        for index in self.signals.curselection():
-            self.signal_units[self.signals.get(index)] = unit
+        for key in self.selected_signal_keys():
+            self.signal_units[key] = unit
         self.refresh_groups(switch_to_custom=False)
         self.units_changed()
 
     def refresh_groups(self, switch_to_custom=True):
         self.group_list.delete(0, tk.END)
         for index, group in enumerate(self.groups, 1):
-            names = [f'{key} [{self.signal_units.get(key, "raw")}]' for key in group]
+            names = [f'{key} [{self.signal_units.get(key, role_unit(key))}]' for key in group]
             self.group_list.insert(tk.END, f'{index}: ' + ', '.join(names))
         if switch_to_custom and self.scene_kind() not in ('custom', 'configured'):
             self.kind.set('custom')
         self.refresh_trace_editor()
 
     def add_group(self):
-        keys = [self.signals.get(i) for i in self.signals.curselection()]
+        keys = self.selected_signal_keys()
         if keys:
             if self.scene_kind() not in ('custom', 'configured'):
                 defaults = self.scenarios[self.kind.get()].get('units', {})
@@ -1100,14 +1614,14 @@ class PlotterApp:
             self.groups.append(keys)
             if self.scene_kind() == 'configured':
                 self.scene_panel_metadata[self.kind.get()].append({
-                    'title': f'Alikuvaaja {len(self.groups)}',
-                    'signals': [{'key': key, 'unit': self.signal_units.get(key, 'raw'),
+                    'title': self.tr('Subplot {number}', number=len(self.groups)),
+                    'signals': [{'key': key, 'unit': self.signal_units.get(key, role_unit(key)),
                                  'scale': '1', 'offset': '0'} for key in keys]})
             self.refresh_groups()
 
     def replace_group(self):
         indices = self.group_list.curselection()
-        keys = [self.signals.get(i) for i in self.signals.curselection()]
+        keys = self.selected_signal_keys()
         if indices and keys:
             scene_id = self.kind.get() if self.scene_kind() in ('custom', 'configured') else 'custom'
             if scene_id == 'custom' and self.scene_kind() not in ('custom', 'configured'):
@@ -1126,7 +1640,7 @@ class PlotterApp:
             self.legend_positions.pop(f'{scene_id}:{indices[0]}', None)
             if self.scene_kind() == 'configured':
                 self.scene_panel_metadata[scene_id][indices[0]]['signals'] = [
-                    {'key': key, 'unit': self.signal_units.get(key, 'raw'), 'scale': '1', 'offset': '0'}
+                    {'key': key, 'unit': self.signal_units.get(key, role_unit(key)), 'scale': '1', 'offset': '0'}
                     for key in keys]
             self.groups[indices[0]] = keys
             self.refresh_groups()
@@ -1189,34 +1703,34 @@ class PlotterApp:
                 return None
             result = float(value)
             if not np.isfinite(result):
-                raise ValueError(f'{key}: arvon on oltava äärellinen')
+                raise ValueError(self.tr('{key}: the value must be finite', key=key))
             return result
         motor = {key: number(key) for key in ('U_nom', 'I_nom', 'f_nom', 'P_nom', 'tau_nom', 'n_p')}
         if any(value <= 0 for value in motor.values()) or not motor['n_p'].is_integer():
-            raise ValueError('Moottoriarvojen on oltava positiivisia; n_p on kokonaisluku')
+            raise ValueError(self.tr('Motor values must be positive; n_p is an integer'))
         motor['n_p'] = int(motor['n_p'])
         torque_mode = self.torque_mode.get()
         if torque_mode not in ('per_unit', 'rated'):
-            raise ValueError('Valitse momentin esitystapa')
+            raise ValueError(self.tr('Select the torque display'))
         pre, post = number('pre'), number('post')
         duration, step = number('duration', True), number('x_step', True)
         minor_step = number('x_minor_step', True)
         if (pre < 0 or post < 0 or (duration is not None and duration <= 0)
                 or (step is not None and step <= 0) or (minor_step is not None and minor_step <= 0)):
-            raise ValueError('Marginaalit ≥ 0; pituus ja aikajaot > 0')
+            raise ValueError(self.tr('Margins ≥ 0; duration and time steps > 0'))
         scene_id = self.kind.get()
         kind = self.scene_kind()
         generic = kind in ('custom', 'configured')
         if generic and not self.groups:
-            raise ValueError('Lisää vähintään yksi alikuvaaja')
+            raise ValueError(self.tr('Add at least one subplot'))
         columns = 1
         if generic:
             try:
                 columns = int(self.columns.get().strip())
             except ValueError as error:
-                raise ValueError('Palstojen määrän on oltava kokonaisluku 1–8') from error
+                raise ValueError(self.tr('The number of columns must be an integer 1–8')) from error
             if not 1 <= columns <= 8:
-                raise ValueError('Palstojen määrän on oltava kokonaisluku 1–8')
+                raise ValueError(self.tr('The number of columns must be an integer 1–8'))
         base = BaseValues(**motor)
         traces = self.current_traces()
         transforms = {}
@@ -1230,19 +1744,19 @@ class PlotterApp:
                     target_id = f'{"custom" if generic else kind}:{target_id.split(":", 1)[1]}'
                 transforms[target_id] = change
         if self.style.get() not in ('screen', 'latex_style') or self.palette.get() not in PALETTES:
-            raise ValueError('Valitse tunnettu tyyli ja paletti')
+            raise ValueError(self.tr('Select a known style and palette'))
         detector = self.detector.get()
         if detector not in ('references', 'spikes'):
-            raise ValueError('Valitse references tai spikes')
+            raise ValueError(self.tr('Select references or spikes'))
         window = {'pre_transient': pre, 'post_transient': post,
                   'duration': duration, 't_offset': number('offset', True), 'detector': detector}
         if detector == 'spikes':
             signal = self.spike_signal.get().strip()
             if not signal:
-                raise ValueError('Valitse mittauspiikkien signaali')
+                raise ValueError(self.tr('Select the signal for measurement spikes'))
             threshold = float(self.spike_threshold.get().strip().replace(',', '.'))
             if not np.isfinite(threshold) or threshold <= 0:
-                raise ValueError('Piikkikynnyksen on oltava positiivinen ja äärellinen')
+                raise ValueError(self.tr('The spike threshold must be positive and finite'))
             window.update(spike_signal=signal, spike_threshold=threshold)
         panels = {trace['panel'] for trace in traces}
         y_limits = {panel: self.axis_limits[f'{scene_id}:{panel}'] for panel in panels
@@ -1264,6 +1778,7 @@ class PlotterApp:
                     units[f'custom:{panel_index}:{signal["key"]}'] = self.signal_units.get(
                         signal['key'], signal['unit'])
         return {'kind': kind, 'scene_id': scene_id, 'base': base, 'window': window,
+                'signal_map': copy.deepcopy(self.current_signal_map()),
                 'suffix': scene.get('suffix', '_custom'), 'columns': columns,
                 'panel_titles': panel_titles,
                 'added_traces': added_traces, 'disabled_traces': disabled_traces,
@@ -1305,8 +1820,8 @@ class PlotterApp:
         self.root.after(50, poll)
 
     def report_error(self, error):
-        self.status.set(f'Virhe: {error}')
-        messagebox.showerror('Plottaus epäonnistui', str(error), parent=self.root)
+        self.status.set(self.tr('Error: {error}', error=error))
+        messagebox.showerror(self.tr('Plotting failed'), str(error), parent=self.root)
 
     def preview(self):
         path = self.active_path()
@@ -1317,13 +1832,15 @@ class PlotterApp:
         except ValueError as error:
             self.report_error(error)
             return
-        self.status.set(f'Luetaan {path.name}…')
+        self.status.set(self.tr('Reading {name}…', name=path.name))
 
         def loaded(payload):
             fig, _ = render_request(payload, options)
             self.show_figure(fig, kind=options['scene_id'])
-            self.preview_source.set(f'Esikatselu: {path}')
-            self.status.set(f'{path.name}: {options["kind"]}. Raahaa legenda; zoom/siirto pois raahauksen ajaksi.')
+            self.preview_path = path
+            self.render_preview_source()
+            self.status.set(self.tr('{name}: {kind}. Drag the legend; switch zoom/pan off while dragging.',
+                                    name=path.name, kind=options['kind']))
         self.start_job(lambda: load_plot_request(path, options), loaded)
 
     def reset_legends(self):
@@ -1399,11 +1916,13 @@ class PlotterApp:
         targets = [((Path(folder).expanduser().resolve() if folder else path.parent) /
                     f'{path.stem}{options["suffix"]}.pdf') for path in paths]
         if len(set(targets)) != len(targets):
-            self.report_error(ValueError('Saman nimiset mittaukset: käytä lähdekansioita tai nimeä tiedostot eri tavoin.'))
+            self.report_error(ValueError(self.tr('Measurements with the same name: use source folders or '
+                                                 'rename the files.')))
             return
         existing = sum(target.exists() for target in targets)
-        if existing and not messagebox.askyesno('Korvataanko PDF:t?',
-                                               f'{existing} tiedostoa on jo olemassa. Korvataanko?', parent=self.root):
+        if existing and not messagebox.askyesno(self.tr('Replace PDFs?'),
+                                               self.tr('{count} files already exist. Replace them?', count=existing),
+                                               parent=self.root):
             return
         self.cancelled = False
         self.batch_active = True
@@ -1413,18 +1932,19 @@ class PlotterApp:
         if not pending or self.cancelled or self.closing:
             self.batch_active = False
             self.set_busy(False)
-            self.status.set(f'Eräajo: {len(saved)} tallennettu, {len(errors)} virhettä'
-                            + ('; keskeytetty.' if self.cancelled else '.'))
+            counts = {'saved': len(saved), 'errors': len(errors)}
+            self.status.set(self.tr('Batch: {saved} saved, {errors} errors; cancelled.', **counts)
+                            if self.cancelled else self.tr('Batch: {saved} saved, {errors} errors.', **counts))
             if errors and not self.closing:
-                messagebox.showwarning('Eräajon virheet', '\n'.join(errors), parent=self.root)
+                messagebox.showwarning(self.tr('Batch errors'), '\n'.join(errors), parent=self.root)
             return
         path, target = pending.pop(0)
-        self.status.set(f'Tallennetaan {path.name}… (jäljellä {len(pending)})')
+        self.status.set(self.tr('Saving {name}… ({count} left)', name=path.name, count=len(pending)))
 
-        def update_row(text):
+        def update_row(state):
             for item, source in self.path_ids.items():
                 if source == path:
-                    self.files.set(item, 'state', text)
+                    self.set_file_state(item, state)
 
         def next_file():
             self.root.after(1, lambda: self.export_next(pending, options, saved, errors))
@@ -1442,7 +1962,7 @@ class PlotterApp:
                 fig.savefig(temporary, dpi=300)
                 temporary.replace(target)
                 saved.append(target)
-                update_row('Tallennettu')
+                update_row('Saved')
             finally:
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)
@@ -1452,14 +1972,14 @@ class PlotterApp:
 
         def failed(error):
             errors.append(f'{path.name}: {error}')
-            update_row('Virhe')
+            update_row('Error')
             next_file()
         self.start_job(lambda: load_plot_request(path, options), loaded, failed)
 
     def cancel(self):
         self.cancelled = True
         if self.busy:
-            self.status.set('Keskeytetään nykyisen tiedoston jälkeen…')
+            self.status.set(self.tr('Cancelling after the current file…'))
 
     def close(self):
         self.closing = True
@@ -1478,7 +1998,8 @@ def main():
         app = PlotterApp(root)
     except ValueError as error:
         root.withdraw()
-        messagebox.showerror('Asetustiedoston virhe', str(error), parent=root)
+        messagebox.showerror(translate('Configuration file error', load_language(SETTINGS_PATH)),
+                             str(error), parent=root)
         root.destroy()
         return
     app.insert_paths(sys.argv[1:])

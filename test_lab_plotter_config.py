@@ -4,7 +4,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from lab_plotter_config import load_motor_profiles, load_scenarios
+from lab_plotter_config import (
+    ROLE_UNITS,
+    SIGNAL_ROLES,
+    default_signal_map,
+    load_motor_profiles,
+    load_scenarios,
+    load_signal_maps,
+    save_signal_map,
+    signal_role,
+)
 
 
 class ConfigTests(unittest.TestCase):
@@ -29,7 +38,9 @@ class ConfigTests(unittest.TestCase):
         example = scenarios['speed-torque']
         self.assertEqual(example['columns'], 2)
         self.assertEqual([signal['key'] for panel in example['panels'] for signal in panel['signals']],
-                         ['wm_ref', 'w_m', 'tau_m'])
+                         ['@w_m_ref', '@w_mest', '@tau_Mest'])
+        self.assertEqual([signal['unit'] for panel in example['panels'] for signal in panel['signals']],
+                         ['rad/s', 'rad/s', 'Nm'])
         self.assertEqual(load_motor_profiles()['default'], self.motor)
 
     def test_reload_order_and_independence(self):
@@ -136,6 +147,83 @@ class ConfigTests(unittest.TestCase):
         self.write('motors', [self.motor, self.motor])
         with self.assertRaisesRegex(ValueError, 'Duplicate'):
             load_motor_profiles(self.path)
+
+    def test_role_keys_in_scenarios_and_role_default_units(self):
+        configured = {'id': 'roles', 'label': 'Roles', 'kind': 'configured', 'suffix': '_r', 'columns': 1,
+                      'panels': [{'title': 'Mixed', 'signals': [
+                          {'key': '@tau_Lref'}, {'key': '@w_m_ref', 'unit': 'raw'}, {'key': 'tau_m'}]}]}
+        preset = dict(self.scenario, added_traces=[{'id': 'extra', 'panel': 0, 'key': '@w_mest'}],
+                      units={'@w_mest': 'rad/s'})
+        self.write('scenarios', [configured, preset])
+        result = load_scenarios(self.path)
+        self.assertEqual([signal['unit'] for signal in result['roles']['panels'][0]['signals']],
+                         ['p.u. (Nm)', 'raw', 'raw'])
+        self.assertEqual(result['variant']['added_traces'][0]['key'], '@w_mest')
+        for scenario in [dict(configured, panels=[{'title': 'x', 'signals': [{'key': '@unknown'}]}]),
+                         dict(preset, added_traces=[{'id': 'extra', 'panel': 0, 'key': '@'}]),
+                         dict(preset, units={'@nope': 'Nm'})]:
+            with self.subTest(scenario=scenario):
+                self.write('scenarios', [scenario])
+                with self.assertRaisesRegex(ValueError, 'unknown quantity role'):
+                    load_scenarios(self.path)
+        self.assertEqual(ROLE_UNITS['i_cs'], 'A')
+        self.assertEqual(signal_role('@w_m_ref'), 'w_m_ref')
+        self.assertIsNone(signal_role('wm_ref'))
+
+    def test_supplied_and_missing_signal_maps_use_builtin_defaults(self):
+        default = default_signal_map()
+        self.assertEqual(load_signal_maps(), {'default': default})
+        self.assertEqual(load_signal_maps(Path(self.directory.name) / 'absent.json'), {'default': default})
+        self.assertEqual(list(default['signals']), [role for role, *_ in SIGNAL_ROLES])
+        self.assertEqual(default['signals']['tau_Lref'], ['tauLref', 'TL_ref'])
+
+    def test_signal_maps_fill_defaults_normalize_and_reject_invalid(self):
+        self.write('signal_maps', [{'id': 'old-model', 'name': 'Old model',
+                                    'signals': {'theta_m': 'theta_m', 'eps_inj': [],
+                                                'tau_Lref': ['TL_refseq1', 'TL_ref']}}])
+        signals = load_signal_maps(self.path)['old-model']['signals']
+        self.assertEqual(signals['theta_m'], ['theta_m'])
+        self.assertEqual(signals['eps_inj'], [])
+        self.assertEqual(signals['tau_Lref'], ['TL_refseq1', 'TL_ref'])
+        self.assertEqual(signals['w_m_ref'], ['wm_ref'])
+        good = {'id': 'x', 'name': 'X', 'signals': {}}
+        for item in [dict(good, signals={'unknown': 'a'}), dict(good, signals={'theta_m': 1}),
+                     dict(good, signals={'theta_m': ['']}), dict(good, signals={'theta_m': [' a']}),
+                     dict(good, signals={'theta_m': ['a', 'a']}), dict(good, signals=[]),
+                     dict(good, id='bad id'), dict(good, name=''), dict(good, extra=1),
+                     {'id': 'x', 'name': 'X'}]:
+            with self.subTest(item=item):
+                self.write('signal_maps', [item])
+                with self.assertRaises(ValueError):
+                    load_signal_maps(self.path)
+        self.write('signal_maps', [good, good])
+        with self.assertRaisesRegex(ValueError, 'Duplicate'):
+            load_signal_maps(self.path)
+
+    def test_save_signal_map_inserts_replaces_and_keeps_invalid_files(self):
+        path = Path(self.directory.name) / 'maps.json'
+        maps = save_signal_map({'id': 'lab-b', 'name': 'Lab B', 'signals': {'theta_m': ['theta_m']}}, path)
+        self.assertEqual(list(maps), ['default', 'lab-b'])
+        self.assertEqual(maps['lab-b']['signals']['theta_m'], ['theta_m'])
+        save_signal_map({'id': 'default', 'name': 'Renamed',
+                         'signals': {'w_m_ref': ['Ref/w ref'], 'u_inj': []}}, path)
+        maps = load_signal_maps(path)
+        self.assertEqual(list(maps), ['default', 'lab-b'])
+        self.assertEqual(maps['default']['name'], 'Renamed')
+        self.assertEqual(maps['default']['signals']['w_m_ref'], ['Ref/w ref'])
+        self.assertEqual(maps['default']['signals']['u_inj'], [])
+        self.assertEqual(json.loads(path.read_text(encoding='utf-8'))['signal_maps'][1]['id'], 'lab-b')
+        before = path.read_text(encoding='utf-8')
+        for entry in [{'id': 'x', 'name': 'X', 'signals': {'unknown': ['a']}},
+                      {'id': '../x', 'name': 'X', 'signals': {}}]:
+            with self.subTest(entry=entry), self.assertRaises(ValueError):
+                save_signal_map(entry, path)
+        path.write_text('{invalid', encoding='utf-8')
+        with self.assertRaises(ValueError):
+            save_signal_map({'id': 'x', 'name': 'X', 'signals': {}}, path)
+        self.assertEqual(path.read_text(encoding='utf-8'), '{invalid')
+        self.assertNotEqual(before, '{invalid')
+        self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ['maps.json'])
 
     def test_bad_json_and_root(self):
         for text in ['{', '{"scenarios": [], "scenarios": []}',
