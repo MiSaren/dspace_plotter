@@ -13,8 +13,11 @@ first alternative present with the expected shape is used; missing quantities
 are NaN. Reference transients follow the mapped w_m_ref and tau_Lref keys.
 Custom panels, added traces and spike detection accept ``@role`` keys, which
 select the signal map's key for that role and default to its recorded unit.
+Every trace has a derived processing (PROCESSING, e.g. magnitude, real part,
+angle wrap) applied before its gain/offset; transforms may replace it.
 """
 import ast
+import re
 import string
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
@@ -25,9 +28,12 @@ from matplotlib.ticker import AutoMinorLocator, MultipleLocator
 
 from lab_plotting import LabDataMat, transient_window
 from lab_plotter_config import (
+    PROCESSING_IDS,
     ROLE_UNITS,
+    SCALAR_PROCESSING,
     SIGNAL_ROLE_IDS,
     SIGNAL_ROLES,
+    VECTOR_PROCESSING,
     default_signal_map,
     signal_keys,
     signal_role,
@@ -62,6 +68,82 @@ DEFAULT_BASE = BaseValues(U_nom=460, I_nom=8.8, f_nom=60,
 DEFAULT_SIGNAL_MAP = default_signal_map()['signals']
 VECTOR_ROLES = frozenset(role for role, _, _, vector, _ in SIGNAL_ROLES if vector)
 REFERENCE_ROLES = ('w_m_ref', 'tau_Lref')
+
+
+def _wrap(y):
+    return np.angle(np.exp(1j*y))
+
+
+# Derived processing: id -> function(values, time, base). Vector operations take
+# a complex space vector; the others act on real values.
+PROCESSING = {
+    'none': lambda y, t, base: y,
+    'abs': lambda y, t, base: np.abs(y),
+    'wrap': lambda y, t, base: _wrap(y),
+    'unwrap': lambda y, t, base: np.unwrap(y),
+    'degrees': lambda y, t, base: np.degrees(y),
+    'wrap_degrees': lambda y, t, base: np.degrees(_wrap(y)),
+    'wrap_mech_degrees': lambda y, t, base: np.degrees(_wrap(y))/base.n_p,
+    'derivative': lambda y, t, base: np.gradient(y, t),
+    'magnitude': lambda z, t, base: np.abs(z),
+    'real': lambda z, t, base: z.real,
+    'imag': lambda z, t, base: z.imag,
+    'angle': lambda z, t, base: np.angle(z),
+}
+assert tuple(PROCESSING) == PROCESSING_IDS
+PROCESSING_LABELS = {
+    'none': 'none', 'abs': 'absolute value |y|', 'wrap': 'wrap to (−π, π]',
+    'unwrap': 'unwrap (continuous angle)', 'degrees': 'radians → degrees',
+    'wrap_degrees': 'wrap to (−180°, 180°]', 'wrap_mech_degrees': 'wrap, mechanical degrees (÷ n_p)',
+    'derivative': 'time derivative d/dt', 'magnitude': 'magnitude |x + jy|', 'real': 'real part',
+    'imag': 'imaginary part', 'angle': 'angle ∠(x + jy) (rad)'}
+# Operations offered for a preset trace keep the quantity of its axis: an angle
+# of a normalized flux would be meaningless after p.u./SI scaling.
+PRESET_PROCESSING = {'real': ('none', 'abs'), 'complex': ('magnitude', 'real', 'imag'),
+                     'angle': ('none', 'wrap', 'unwrap', 'degrees', 'wrap_degrees', 'wrap_mech_degrees')}
+_RADIAN_OUTPUT = frozenset(('wrap', 'unwrap', 'angle'))
+_DEGREE_OUTPUT = frozenset(('degrees', 'wrap_degrees', 'wrap_mech_degrees'))
+_VECTOR_LABELS = {'magnitude': '|{key}|', 'real': 'Re({key})', 'imag': 'Im({key})', 'angle': '∠{key}'}
+_INPUT_NOTES = {'i_c': 'dq frame: i_cs·exp(−jθm)', 'theta_err': 'measured − estimated angle'}
+
+
+def processing_unit(processing, unit):
+    """Displayed unit after processing; None keeps the signal's unit conversion."""
+    if processing in _RADIAN_OUTPUT:
+        return 'rad'
+    if processing in _DEGREE_OUTPUT:
+        return 'deg'
+    return None
+
+
+def process_components(components, processing, base, key):
+    """Apply processing to the (true key, time, values) components of one signal.
+
+    Vector operations combine 2 (x + jy) or 3 (abc) components on one raster
+    into a single trace; scalar operations keep one trace per component.
+    """
+    if processing in VECTOR_PROCESSING:
+        if len(components) not in (2, 3) or any(not np.array_equal(time, components[0][1])
+                                                for _, time, _ in components):
+            raise ValueError(f"{key}: '{processing}' needs a 2- or 3-element vector on one time raster")
+        values = [np.asarray(values, dtype=float) for _, _, values in components]
+        if len(values) == 2:
+            vector = values[0] + 1j*values[1]
+        else:
+            a = np.exp(2j*np.pi/3)
+            vector = 2/3*(values[0] + a*values[1] + a**2*values[2])
+        time = components[0][1]
+        name = re.sub(r'\[\d+\]$', '', components[0][0])
+        return [(_VECTOR_LABELS[processing].format(key=name), time, PROCESSING[processing](vector, time, base))]
+    if processing not in SCALAR_PROCESSING:
+        raise ValueError(f'{key}: unknown processing {processing!r}')
+    result = []
+    for true_key, time, values in components:
+        if processing == 'derivative' and time.size < 2:
+            raise ValueError(f'{key}: a derivative needs at least two samples')
+        label = f'd{true_key}/dt' if processing == 'derivative' else true_key
+        result.append((label, time, PROCESSING[processing](np.asarray(values, dtype=float), time, base)))
+    return result
 
 
 def complete_signal_map(signal_map=None):
@@ -207,6 +289,7 @@ def load_measurement(path, motor_base=None, *, x_step=None, extra_signals=None,
         for role in SIGNAL_ROLE_IDS:
             setattr(context, role, get(role))
         context.theta_mest = context.theta_m.copy()
+        context.theta_err = context.theta_meas - context.theta_m
         context.w_m = context.w_mest
         context.i_c = context.i_cs*np.exp(-1j*context.theta_m)
         context.u_s = np.abs(context.u_c)
@@ -572,42 +655,52 @@ def scalar_expression(expression, base):
 
 
 def subplot_traces(kind, groups=(), signal_map=None, unlinked='({role} not linked)'):
-    """Describe every plotted trace and its editable pre-normalization gain.
+    """Describe every plotted trace, its derived processing and pre-normalization gain.
 
-    The stage column documents non-affine derived operations that remain intact.
-    Offsets use the selected/stage signal's input units, before p.u. conversion.
-    Preset and @role sources show the signal_map keys (unlinked formats a role
-    without keys); 'roles' lists the quantities used. Titles are English.
+    'processing' is the default derived operation, 'operations' those a
+    transform may choose instead, and 'input' the context attribute it acts on
+    (presets: (processing(input) * scale + offset) / divisor). 'stage' is an
+    English description. Offsets use the processed signal's input units, before
+    p.u. conversion. Preset and @role sources show the signal_map keys
+    (unlinked formats a role without keys); 'roles' lists the quantities used.
     """
     mapping = complete_signal_map(signal_map)
     names = {role: ' / '.join(keys) if keys else unlinked.format(role=role)
              for role, keys in mapping.items()}
-    speed = [('{w_m_ref}', '', '1', 'w'), ('{w_mest}', '', '1', 'w')]
-    flux = [('{psi_sref}', 'abs', '1', 'psi'), ('{psi_sest}', 'abs(complex)', '1', 'psi')]
-    torque = [('{tau_Mref_lim}', '', '1', 'tau'), ('{tau_Mest}', '', '1', 'tau'),
-              ('{tau_Lref}', 'recorded p.u.', '1', '')]
-    currents = [('{i_cs} + {theta_m}', 'real(complex current * exp(-j angle))', '1', 'i'),
-                ('{i_cs} + {theta_m}', 'imag(complex current * exp(-j angle))', '1', 'i')]
-    voltage = [('{u_dc}', '', '1/sqrt3', 'u'), ('{u_c}', 'abs(complex)', '1', 'u')]
+    # (source template, input attribute, input kind, default processing, gain, divisor)
+    speed = [('{w_m_ref}', 'w_m_ref', 'real', 'none', '1', 'w'),
+             ('{w_mest}', 'w_mest', 'real', 'none', '1', 'w')]
+    flux = [('{psi_sref}', 'psi_sref', 'real', 'abs', '1', 'psi'),
+            ('{psi_sest}', 'psi_sest', 'complex', 'magnitude', '1', 'psi')]
+    torque = [('{tau_Mref_lim}', 'tau_Mref_lim', 'real', 'none', '1', 'tau'),
+              ('{tau_Mest}', 'tau_Mest', 'real', 'none', '1', 'tau'),
+              ('{tau_Lref}', 'tau_Lref', 'real', 'none', '1', '')]
+    currents = [('{i_cs} + {theta_m}', 'i_c', 'complex', 'real', '1', 'i'),
+                ('{i_cs} + {theta_m}', 'i_c', 'complex', 'imag', '1', 'i')]
+    voltage = [('{u_dc}', 'u_dc', 'real', 'none', '1/sqrt3', 'u'),
+               ('{u_c}', 'u_c', 'complex', 'magnitude', '1', 'u')]
     if kind == 'custom':
         def source(key):
             role = signal_role(key)
             return f'{key} → {names[role]}' if role in names else key
         return [{'panel': panel, 'title': f'Subplot {panel + 1}',
-                 'id': f'custom:{panel}:{key}', 'source': source(key), 'stage': 'recorded value',
-                 'scale': '1', 'offset': '0', 'divisor': '',
+                 'id': f'custom:{panel}:{key}', 'source': source(key), 'stage': 'none',
+                 'scale': '1', 'offset': '0', 'divisor': '', 'input': key, 'processing': 'none',
+                 'operations': PROCESSING_IDS, 'note': '',
                  'roles': (signal_role(key),) if signal_role(key) in names else ()}
                 for panel, group in enumerate(groups) for key in group]
     if kind == 'hfsi':
-        torque = [('{tau_Mref_lim}', '', '1', 'tau_nom'), ('{tau_Mest}', '', '1', 'tau_nom'),
-                  ('{tau_Lref}', 'recorded p.u.; legacy rated-torque calibration', '1/0.88', '')]
-        panels = [('Speed', speed + [('{w_m_meas}', '', '1/2', 'w')]),
+        torque = [('{tau_Mref_lim}', 'tau_Mref_lim', 'real', 'none', '1', 'tau_nom'),
+                  ('{tau_Mest}', 'tau_Mest', 'real', 'none', '1', 'tau_nom'),
+                  ('{tau_Lref}', 'tau_Lref', 'real', 'none', '1/0.88', '')]
+        panels = [('Speed', speed + [('{w_m_meas}', 'w_m_meas', 'real', 'none', '1/2', 'w')]),
                   ('Currents', currents), ('Flux', flux),
-                  ('Angle error', [('{eps_inj}', 'degrees', '1', ''),
-                                 ('{theta_meas} - {theta_m}', 'wrapped mechanical degrees', '1', '')]),
+                  ('Angle error', [('{eps_inj}', 'eps_inj', 'angle', 'degrees', '1', ''),
+                                 ('{theta_meas} - {theta_m}', 'theta_err', 'angle', 'wrap_mech_degrees',
+                                  '1', '')]),
                   ('Torque', torque),
-                  ('Angle', [('{theta_m} (observer)', 'wrap to (-pi, pi]', '1', ''),
-                             ('{theta_meas} (measured)', 'wrap to (-pi, pi]', '1', '')])]
+                  ('Angle', [('{theta_m} (observer)', 'theta_mest', 'angle', 'wrap', '1', ''),
+                             ('{theta_meas} (measured)', 'theta_meas', 'angle', 'wrap', '1', '')])]
     elif kind in ('overview', 'injection-overview', 'presentation'):
         if kind == 'presentation':
             torque = [torque[1], torque[0], torque[2]]
@@ -615,17 +708,20 @@ def subplot_traces(kind, groups=(), signal_map=None, unlinked='({role} not linke
         if kind == 'overview':
             panels.append(('Voltages', voltage))
         elif kind == 'injection-overview':
-            panels.append(('Injection voltages', [('{u_inj}', 'real(complex)', '1', ''),
-                                                 ('{u_inj}', 'imag(complex)', '1', '')]))
+            panels.append(('Injection voltages', [('{u_inj}', 'u_inj', 'complex', 'real', '1', ''),
+                                                 ('{u_inj}', 'u_inj', 'complex', 'imag', '1', '')]))
     else:
         raise ValueError(f'Unknown figure type: {kind}')
     return [{'panel': panel, 'title': title, 'id': f'{kind}:{panel}:{line}',
-             'source': source.format(**names), 'stage': stage, 'scale': scale, 'offset': '0',
-             'divisor': divisor,
+             'source': source.format(**names), 'scale': scale, 'offset': '0', 'divisor': divisor,
+             'input': attribute, 'processing': processing, 'operations': PRESET_PROCESSING[input_kind],
+             'note': _INPUT_NOTES.get(attribute, ''),
+             'stage': PROCESSING_LABELS[processing] + (f' · {_INPUT_NOTES[attribute]}'
+                                                       if attribute in _INPUT_NOTES else ''),
              'roles': tuple(dict.fromkeys(field for _, field, _, _ in string.Formatter().parse(source)
                                           if field))}
             for panel, (title, traces) in enumerate(panels)
-            for line, (source, stage, scale, divisor) in enumerate(traces)]
+            for line, (source, attribute, input_kind, processing, scale, divisor) in enumerate(traces)]
 
 
 def _apply_trace_transforms(context, kind, axes, transforms):
@@ -639,12 +735,15 @@ def _apply_trace_transforms(context, kind, axes, transforms):
         if trace['id'] not in transforms:
             continue
         change = transforms[trace['id']]
+        processing = change.get('processing', trace['processing'])
+        if processing not in trace['operations']:
+            raise ValueError(f"{trace['id']}: processing {processing!r} is not available; "
+                             f"use one of {list(trace['operations'])}")
         scale = scalar_expression(change['scale'], context.base)
         offset = scalar_expression(change['offset'], context.base)
-        default = scalar_expression(trace['scale'], context.base)
         divisor = getattr(context.base, trace['divisor']) if trace['divisor'] else 1.
-        # Undo only the legacy affine gain; retain complex/angle processing.
-        values = np.asarray(line.get_ydata()) * divisor / default
+        # Recompute from the trace's input, replacing the preset gain and processing.
+        values = PROCESSING[processing](np.asarray(getattr(context, trace['input'])), context.t, context.base)
         line.set_ydata((values * scale + offset) / divisor)
         modified.add(trace['panel'])
     for panel, axis in enumerate(np.asarray(axes).flat):
@@ -773,11 +872,17 @@ def plot_measurement(context, figure_type, *, per_unit=None, transforms=None,
         change = (transforms or {}).get(trace_id, {})
         scale = scalar_expression(change.get('scale', '1'), context.base)
         offset = scalar_expression(change.get('offset', '0'), context.base)
-        for true_key, time, values in components:
+        processing = change.get('processing', 'none')
+        for (true_key, _, _), (label, time, values) in zip(
+                components, process_components(components, processing, context.base, key)):
             unit = (units or {}).get(true_key, (units or {}).get(key, role_unit(key)))
             factor, display_unit = signal_scale(unit, context.base, bool(per_unit),
                                                 torque_mode=torque_mode)
-            prepared.append((panel, f'{true_key} ({display_unit})',
+            if processing_unit(processing, display_unit):
+                factor, display_unit = 1., processing_unit(processing, display_unit)
+            elif processing == 'derivative':
+                display_unit += '/s'
+            prepared.append((panel, f'{label} ({display_unit})',
                              time - context.t_offset, (values * scale + offset) * factor))
     existing = set(plt.get_fignums())
     try:
@@ -878,6 +983,7 @@ def plot_signals(data, groups, t_offset=0, t_span=None, x_step=None, *,
             signals = data.signal_info(role_key(data, key, signal_map))
             if not signals:
                 raise ValueError(f"Signal '{key}' has no components")
+            components = []
             for signal in signals:
                 true_key = signal["key"]
                 time = np.asarray(data.time(true_key), dtype=float)
@@ -889,15 +995,23 @@ def plot_signals(data, groups, t_offset=0, t_span=None, x_step=None, *,
                         or not np.issubdtype(values.dtype, np.number)
                         or np.iscomplexobj(values)):
                     raise ValueError(f"Signal '{true_key}' must be a real vector matching its time")
+                components.append((true_key, time.copy(), values.copy()))
+            change = (transforms or {}).get(f'custom:{panel_index}:{key}', {'scale': '1', 'offset': '0'})
+            scale = scalar_expression(change['scale'], motor_base)
+            offset = scalar_expression(change['offset'], motor_base)
+            processing = change.get('processing', 'none')
+            for (true_key, _, _), (name, time, values) in zip(
+                    components, process_components(components, processing, motor_base, key)):
                 unit_map = units or {}
                 trace_unit = unit_map.get(f'custom:{panel_index}:{key}',
                                           unit_map.get(true_key, unit_map.get(key, role_unit(key))))
                 factor, unit = signal_scale(trace_unit, motor_base, per_unit, torque_mode=torque_mode)
-                change = (transforms or {}).get(f'custom:{panel_index}:{key}', {'scale': '1', 'offset': '0'})
-                scale = scalar_expression(change['scale'], motor_base)
-                offset = scalar_expression(change['offset'], motor_base)
-                label = f"{true_key} ({unit})" if units is not None else true_key
-                panel.append((label, time.copy() - origin, (values.copy()*scale + offset)*factor))
+                if processing_unit(processing, unit):
+                    factor, unit = 1., processing_unit(processing, unit)
+                elif processing == 'derivative':
+                    unit += '/s'
+                label = f"{name} ({unit})" if units is not None else name
+                panel.append((label, time - origin, (values*scale + offset)*factor))
         panels.append(panel)
     existing = set(plt.get_fignums())
     try:

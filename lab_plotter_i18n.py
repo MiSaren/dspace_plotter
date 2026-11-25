@@ -158,19 +158,43 @@ FINNISH = {
     'Restore Y steps': 'Palauta Y-jaot',
     'Steps are in displayed units. Empty = default; switching p.u. does not convert the set steps.':
         'Jaot ovat näkyvissä yksiköissä. Tyhjä = oletus; p.u.-vaihto ei muunna asetettuja jakoja.',
+    'Processing': 'Käsittely',
+    'y → processing → gain × y + offset before p.u. conversion. The processing list shows the operations '
+    'that suit the selected trace; vector operations combine a 2–3-element signal into one trace, and '
+    'angle operations are shown in rad or deg. Mechanical → electrical speed: gain n_p (replaces the '
+    'current gain). Allowed e.g. 1/n_p, 2*n_p, -1, i_base. The edited axis is autoscaled.':
+        'y → käsittely → kerroin × y + lisäys ennen p.u.-muunnosta. Käsittelyluettelo näyttää valitulle '
+        'signaalille sopivat toiminnot; vektoritoiminnot yhdistävät 2–3-alkioisen signaalin yhdeksi '
+        'käyräksi, ja kulmatoiminnot näytetään radiaaneina tai asteina. Mekaaninen → sähköinen nopeus: '
+        'kerroin n_p (korvaa nykyisen kertoimen). Sallittu esim. 1/n_p, 2*n_p, -1, i_base. '
+        'Muokatun akselin y-rajaus on automaattinen.',
+    # Derived processing (lab_plotter_core.PROCESSING_LABELS)
+    'absolute value |y|': 'itseisarvo |y|',
+    'wrap to (−π, π]': 'kääri välille (−π, π]',
+    'unwrap (continuous angle)': 'jatkuva kulma (unwrap)',
+    'radians → degrees': 'radiaanit → asteet',
+    'wrap to (−180°, 180°]': 'kääri välille (−180°, 180°]',
+    'wrap, mechanical degrees (÷ n_p)': 'kääri, mekaaniset asteet (÷ n_p)',
+    'time derivative d/dt': 'aikaderivaatta d/dt',
+    'magnitude |x + jy|': 'vektorin pituus |x + jy|',
+    'real part': 'reaaliosa',
+    'imaginary part': 'imaginaariosa',
+    'angle ∠(x + jy) (rad)': 'kulma ∠(x + jy) (rad)',
+    'dq frame: i_cs·exp(−jθm)': 'dq-koordinaatisto: i_cs·exp(−jθm)',
+    'measured − estimated angle': 'mitattu − estimoitu kulma',
     'Set transform': 'Aseta muunnos',
     'Reset selected to default': 'Palauta valittu oletukseen',
-    'y → gain × y + offset before p.u. conversion. Mechanical → electrical speed: gain n_p (replaces '
-    'the current gain). Allowed e.g. 1/n_p, 2*n_p, -1, i_base. The edited axis is autoscaled.':
-        'y → kerroin × y + lisäys ennen p.u.-muunnosta. Mekaaninen → sähköinen nopeus: kerroin n_p '
-        '(korvaa nykyisen kertoimen). Sallittu esim. 1/n_p, 2*n_p, -1, i_base. '
-        'Muokatun akselin y-rajaus on automaattinen.',
     'PDF export': 'PDF-tallennus',
     'Empty = source folder of each measurement': 'Tyhjä = kunkin mittauksen lähdekansio',
     'Output folder…': 'Tallennuskansio…',
     'Source folder': 'Lähdekansio',
     'Preview': 'Esikatsele',
     'Save selected as PDF': 'Tallenna valitut PDF',
+    'Compare side by side': 'Vertaa vierekkäin',
+    'Same axis limits and zoom when comparing': 'Samat akselirajat ja zoom vertailussa',
+    'Select two measurements to compare (Ctrl+click).': 'Valitse kaksi mittausta vertailuun (Ctrl+napsautus).',
+    'Comparison: {paths}': 'Vertailu: {paths}',
+    'Comparing {first} and {second} ({kind}).': 'Verrataan: {first} ja {second} ({kind}).',
     'Cancel batch': 'Keskeytä eräajo',
     'Reset legends of this figure type': 'Palauta tämän kuvatyypin legendit',
     "Drag legends in the preview (zoom/pan off). Positions are kept in this session's PDF batches.":

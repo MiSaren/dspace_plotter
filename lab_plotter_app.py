@@ -13,9 +13,13 @@ use the motor parameters shown in the settings. No notebook is required.
 
 The preview header shows the full source path of the displayed figure, even
 when selection changes or a batch export updates the status line; it is not
-included in exported PDFs.
+included in exported PDFs. Compare side by side previews two selected
+measurements with the same settings; by default corresponding axes share
+limits and zoom/pan, and setting changes redraw the comparison.
 
-The subplot tree lists every preset/custom trace, source and derived stage.
+The subplot tree lists every preset/custom trace, source and derived processing;
+the processing list offers only operations that suit the trace (vector
+operations combine a 2-3-element signal into one trace).
 For a preset, select a target subplot or its trace, choose recording signals,
 then add them. Toggle a preset trace off/on or remove an added trace. Added
 signals use the selected input unit (raw by default), keep their own rasters,
@@ -80,9 +84,11 @@ from matplotlib.ticker import AutoMinorLocator, MultipleLocator, NullLocator, Sc
 
 from lab_plotter_config import (
     MOTOR_PATH,
+    SCALAR_PROCESSING,
     SCENARIO_PATH,
     SIGNAL_MAP_PATH,
     SIGNAL_ROLES,
+    VECTOR_PROCESSING,
     load_motor_profiles,
     load_scenarios,
     load_signal_maps,
@@ -93,6 +99,7 @@ from lab_plotter_i18n import LANGUAGES, SETTINGS_PATH, load_language, save_langu
 from lab_plotting import LabDataMat, signal_source, transient_window
 from lab_plotter_core import (
     FIGURE_TYPES,
+    PROCESSING_LABELS,
     REFERENCE_ROLES,
     SIGNAL_UNITS,
     VECTOR_ROLES,
@@ -217,6 +224,43 @@ def apply_legend_positions(figure, positions):
             if legend is not None:
                 legend.set_bbox_to_anchor(None)
                 legend.set_loc(tuple(position))
+
+
+def align_limits(figures):
+    """Give corresponding axes of comparison figures common x and y limits."""
+    if len({len(figure.axes) for figure in figures}) != 1:
+        return
+    for group in zip(*(figure.axes for figure in figures)):
+        for get, put in (('get_xlim', 'set_xlim'), ('get_ylim', 'set_ylim')):
+            limits = [getattr(axis, get)() for axis in group]
+            low, high = min(limit[0] for limit in limits), max(limit[1] for limit in limits)
+            for axis in group:
+                getattr(axis, put)(low, high)
+
+
+def link_axes(figures):
+    """Mirror zoom and pan between corresponding axes of comparison figures."""
+    if len({len(figure.axes) for figure in figures}) != 1:
+        return
+    state = {'busy': False}
+
+    def mirror(source, group, which):
+        if state['busy']:
+            return
+        state['busy'] = True
+        try:
+            limits = source.get_xlim() if which == 'x' else source.get_ylim()
+            for other in group:
+                if other is not source:
+                    (other.set_xlim if which == 'x' else other.set_ylim)(limits)
+                    other.figure.canvas.draw_idle()
+        finally:
+            state['busy'] = False
+
+    for group in zip(*(figure.axes for figure in figures)):
+        for axis in group:
+            axis.callbacks.connect('xlim_changed', lambda changed, group=group: mirror(changed, group, 'x'))
+            axis.callbacks.connect('ylim_changed', lambda changed, group=group: mirror(changed, group, 'y'))
 
 
 def render_request(payload, options):
@@ -502,6 +546,8 @@ class PlotterApp:
         self._translations = []
         self.file_states = {}
         self.preview_path = None
+        self.compare_paths = None
+        self.previews = []
         root.title(self.tr('Lab plotter — measurement browser'))
         root.geometry('1400x900')
         self.executor = ThreadPoolExecutor(max_workers=1)
@@ -556,8 +602,11 @@ class PlotterApp:
         self.spike_threshold = tk.StringVar()
         self.edit_scale = tk.StringVar(value='1')
         self.edit_offset = tk.StringVar(value='0')
+        self.edit_processing = tk.StringVar()
+        self.processing_choices = {}
         self.trace_detail = tk.StringVar()
         self.per_unit = tk.BooleanVar(value=True)
+        self.compare_linked = tk.BooleanVar(value=True)
         self.torque_mode = tk.StringVar(value='per_unit')
         self.input_unit = tk.StringVar(value='raw')
         self.path_ids = {}
@@ -625,8 +674,12 @@ class PlotterApp:
         self.status.set(self.tr('Language changed.'))
 
     def render_preview_source(self):
-        self.preview_source.set(self.tr('Preview: {path}', path=self.preview_path)
-                                if self.preview_path is not None else self.tr('Preview: no figure'))
+        if isinstance(self.preview_path, list):
+            self.preview_source.set(self.tr('Comparison: {paths}',
+                                            paths=' | '.join(str(path) for path in self.preview_path)))
+        else:
+            self.preview_source.set(self.tr('Preview: {path}', path=self.preview_path)
+                                    if self.preview_path is not None else self.tr('Preview: no figure'))
 
     def set_file_state(self, item, state):
         self.file_states[item] = state
@@ -671,6 +724,8 @@ class PlotterApp:
                     for signal in definition['signals']:
                         trace_id = f'{scene_id}:{panel}:{signal["key"]}'
                         change = {'scale': signal['scale'], 'offset': signal['offset']}
+                        if 'processing' in signal:
+                            change['processing'] = signal['processing']
                         self.default_transforms[trace_id] = change.copy()
                         self.transform_overrides[trace_id] = change.copy()
             else:
@@ -924,7 +979,7 @@ class PlotterApp:
             parts.append(self.tr('Session edits of changed scenarios were reset.'))
         self.status.set(' '.join(parts))
         if (changed or map_changed or (profile_changed and not dirty)) and self.figure is not None:
-            self.preview()
+            self.redraw()
 
     def _build(self):
         pane = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
@@ -949,6 +1004,8 @@ class PlotterApp:
         preview_label.pack(side=tk.TOP, fill=tk.X)
         self.plot_area.bind('<Configure>', lambda event: preview_label.configure(
             wraplength=max(200, event.width - 12)))
+        self.preview_frame = ttk.Frame(self.plot_area)
+        self.preview_frame.pack(fill=tk.BOTH, expand=True)
         language_row = ttk.Frame(sidebar)
         language_row.pack(fill=tk.X, pady=(0, 4))
         ttk.Label(language_row, text='Kieli / Language').pack(side=tk.LEFT)
@@ -1175,15 +1232,24 @@ class PlotterApp:
         ttk.Entry(edit_row, textvariable=self.edit_scale, width=14).pack(side=tk.LEFT)
         self._t(ttk.Label(edit_row), 'Offset').pack(side=tk.LEFT)
         ttk.Entry(edit_row, textvariable=self.edit_offset, width=14).pack(side=tk.LEFT)
+        processing_row = ttk.Frame(editor)
+        processing_row.pack(fill=tk.X)
+        self._t(ttk.Label(processing_row), 'Processing').pack(side=tk.LEFT)
+        self.processing_box = ttk.Combobox(processing_row, textvariable=self.edit_processing,
+                                           state='disabled', width=40)
+        self.processing_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.processing_box.bind('<<ComboboxSelected>>', lambda _event: self.assign_transform())
         edit_buttons = ttk.Frame(editor)
         edit_buttons.pack(fill=tk.X)
         self._t(ttk.Button(edit_buttons, command=self.assign_transform), 'Set transform').pack(side=tk.LEFT)
         self._t(ttk.Button(edit_buttons, command=self.reset_transform),
                 'Reset selected to default').pack(side=tk.LEFT)
         self._t(ttk.Label(editor, wraplength=430),
-                'y → gain × y + offset before p.u. conversion. Mechanical → electrical speed: gain n_p '
-                '(replaces the current gain). Allowed e.g. 1/n_p, 2*n_p, -1, i_base. The edited axis is '
-                'autoscaled.').pack(anchor=tk.W)
+                'y → processing → gain × y + offset before p.u. conversion. The processing list shows the '
+                'operations that suit the selected trace; vector operations combine a 2–3-element signal '
+                'into one trace, and angle operations are shown in rad or deg. Mechanical → electrical '
+                'speed: gain n_p (replaces the current gain). Allowed e.g. 1/n_p, 2*n_p, -1, i_base. The '
+                'edited axis is autoscaled.').pack(anchor=tk.W)
         self.refresh_trace_editor()
         export = self._t(ttk.LabelFrame(sidebar, padding=5), 'PDF export')
         export.pack(fill=tk.X)
@@ -1195,9 +1261,13 @@ class PlotterApp:
         actions.pack(fill=tk.X, pady=5)
         self.preview_button = self._t(ttk.Button(actions, command=self.preview), 'Preview')
         self.preview_button.pack(side=tk.LEFT)
+        self.compare_button = self._t(ttk.Button(actions, command=self.compare), 'Compare side by side')
+        self.compare_button.pack(side=tk.LEFT)
         self.export_button = self._t(ttk.Button(actions, command=self.export), 'Save selected as PDF')
         self.export_button.pack(side=tk.LEFT)
         self._t(ttk.Button(actions, command=self.cancel), 'Cancel batch').pack(side=tk.LEFT)
+        self._t(ttk.Checkbutton(sidebar, variable=self.compare_linked, command=self.units_changed),
+                'Same axis limits and zoom when comparing').pack(anchor=tk.W)
         self._t(ttk.Button(sidebar, command=self.reset_legends),
                 'Reset legends of this figure type').pack(anchor=tk.W)
         self._t(ttk.Label(sidebar, wraplength=430),
@@ -1328,16 +1398,37 @@ class PlotterApp:
             if kind == 'configured' and trace['panel'] < len(self.scene_panel_metadata[scene_id]):
                 trace['title'] = self.scene_panel_metadata[scene_id][trace['panel']]['title']
             if kind == 'hfsi' and native_id == 'hfsi:4:2' and self.torque_mode.get() == 'rated':
-                trace['stage'] = self.tr('recorded p.u.; converted to rated torque')
+                trace['note'] = 'recorded p.u.; converted to rated torque'
                 trace['scale'] = '1'
+            if kind in ('custom', 'configured'):
+                trace['operations'] = self.signal_operations(trace['input'])
         if kind not in ('custom', 'configured'):
             titles = {trace['panel']: trace['title'] for trace in traces}
             for added in self.preset_added[scene_id]:
                 traces.append({'id': added['id'], 'panel': added['panel'],
                                'title': titles[added['panel']], 'source': added['key'],
-                               'stage': self.tr('added, own time raster of the recording'),
+                               'note': 'added, own time raster of the recording', 'processing': 'none',
+                               'operations': self.signal_operations(added['key']),
                                'scale': '1', 'offset': '0', 'divisor': '', 'roles': ()})
+        for trace in traces:
+            processing = self.transform_overrides.get(trace['id'], {}).get('processing', trace['processing'])
+            trace['stage'] = self.processing_text(trace, processing)
         return traces
+
+    def signal_operations(self, key):
+        """Processing ids for a recording or @role key; vector ones only for 2–3-element vectors."""
+        if self.signal_catalog is None:
+            return SCALAR_PROCESSING + VECTOR_PROCESSING
+        try:
+            actual = role_key(self.signal_catalog, key, self.current_signal_map())
+        except ValueError:
+            return SCALAR_PROCESSING
+        vector = signal_matches(self.signal_catalog, actual, True)
+        return SCALAR_PROCESSING + VECTOR_PROCESSING if vector else SCALAR_PROCESSING
+
+    def processing_text(self, trace, processing):
+        text = self.tr(PROCESSING_LABELS[processing])
+        return f"{text} · {self.tr(trace['note'])}" if trace.get('note') else text
 
     def refresh_trace_editor(self, select_id=None):
         if select_id is None:
@@ -1366,6 +1457,9 @@ class PlotterApp:
             self.y_max.set('')
             self.y_major_step.set('')
             self.y_minor_step.set('')
+            self.processing_choices = {}
+            self.processing_box.configure(values=(), state='disabled')
+            self.edit_processing.set('')
             self.trace_detail.set(self.tr('Select a subplot for its Y limits or a signal for its calculations.'))
 
     def add_preset_signals(self):
@@ -1448,6 +1542,9 @@ class PlotterApp:
         self.y_major_step.set('' if steps[0] is None else str(steps[0]))
         self.y_minor_step.set('' if steps[1] is None else str(steps[1]))
         if selected[0] not in self.trace_records:
+            self.processing_choices = {}
+            self.processing_box.configure(values=(), state='disabled')
+            self.edit_processing.set('')
             self.trace_detail.set(self.tr('{title}: edit the Y-axis limits.',
                                           title=self.panel_records[selected[0]]['title']))
             return
@@ -1455,6 +1552,9 @@ class PlotterApp:
         change = self.transform_overrides.get(trace['id'], trace)
         self.edit_scale.set(change['scale'])
         self.edit_offset.set(change['offset'])
+        self.processing_choices = {self.tr(PROCESSING_LABELS[name]): name for name in trace['operations']}
+        self.processing_box.configure(values=tuple(self.processing_choices), state='readonly')
+        self.edit_processing.set(self.tr(PROCESSING_LABELS[change.get('processing', trace['processing'])]))
         self.trace_detail.set(self.tr('{title}: {source}. Derived processing: {stage}. Default gain: {scale}.',
                                       title=trace['title'], source=trace['source'],
                                       stage=trace['stage'] or self.tr('none'), scale=trace['scale']))
@@ -1540,8 +1640,10 @@ class PlotterApp:
         selected = self.trace_tree.selection()
         if not selected or selected[0] not in self.trace_records:
             return
+        trace = self.trace_records[selected[0]]
         change = {'scale': self.edit_scale.get().strip().replace(',', '.'),
-                  'offset': self.edit_offset.get().strip().replace(',', '.')}
+                  'offset': self.edit_offset.get().strip().replace(',', '.'),
+                  'processing': self.processing_choices.get(self.edit_processing.get(), trace['processing'])}
         try:
             base = self.options()['base']
             scalar_expression(change['scale'], base)
@@ -1566,7 +1668,7 @@ class PlotterApp:
     def units_changed(self):
         self.refresh_trace_editor()
         if self.figure is not None and not self.busy and not self.batch_active:
-            self.preview()
+            self.redraw()
 
     def unit_selection_changed(self, _event=None):
         selected = self.selected_signal_keys()
@@ -1793,7 +1895,7 @@ class PlotterApp:
 
     def set_busy(self, value):
         self.busy = value
-        for button in (self.preview_button, self.export_button):
+        for button in (self.preview_button, self.compare_button, self.export_button):
             button.configure(state=tk.DISABLED if value or self.batch_active else tk.NORMAL)
 
     def start_job(self, work, success, failure=None):
@@ -1837,11 +1939,54 @@ class PlotterApp:
         def loaded(payload):
             fig, _ = render_request(payload, options)
             self.show_figure(fig, kind=options['scene_id'])
+            self.compare_paths = None
             self.preview_path = path
             self.render_preview_source()
             self.status.set(self.tr('{name}: {kind}. Drag the legend; switch zoom/pan off while dragging.',
                                     name=path.name, kind=options['kind']))
         self.start_job(lambda: load_plot_request(path, options), loaded)
+
+    def redraw(self):
+        """Refresh the shown preview or comparison with the current settings."""
+        if self.compare_paths and all(path in self.path_ids.values() for path in self.compare_paths):
+            self.compare(self.compare_paths)
+        else:
+            self.preview()
+
+    def compare(self, paths=None):
+        """Preview two selected measurements side by side with identical settings."""
+        paths = self.selected_paths() if paths is None else list(paths)
+        if len(paths) != 2:
+            self.status.set(self.tr('Select two measurements to compare (Ctrl+click).'))
+            return
+        try:
+            options = self.options()
+        except ValueError as error:
+            self.report_error(error)
+            return
+        linked = self.compare_linked.get()
+        self.status.set(self.tr('Reading {name}…', name=', '.join(path.name for path in paths)))
+
+        def loaded(payloads):
+            figures = []
+            try:
+                for payload in payloads:
+                    figures.append(render_request(payload, options)[0])
+                if linked:
+                    align_limits(figures)
+            except Exception:
+                for figure in figures:
+                    plt.close(figure)
+                raise
+            self.show_figures(figures, kind=options['scene_id'], titles=[path.name for path in paths])
+            if linked:
+                link_axes(figures)
+            self.compare_paths = paths
+            self.preview_path = paths
+            self.render_preview_source()
+            self.status.set(self.tr('Comparing {first} and {second} ({kind}).', first=paths[0].name,
+                                    second=paths[1].name, kind=options['kind']))
+        self.start_job(lambda: [load_plot_request(path, options) for path in paths], loaded)
 
     def reset_legends(self):
         prefix = f'{self.kind.get()}:'
@@ -1850,58 +1995,81 @@ class PlotterApp:
         self.units_changed()
 
     def show_figure(self, fig, kind=None):
+        self.show_figures([fig], kind)
+
+    def show_figures(self, figures, kind=None, titles=None):
+        """Embed figures side by side, each with its own toolbar, replacing the preview."""
         kind = self.kind.get() if kind is None else kind
-        canvas = toolbar = None
+        frames, built = [], []
         try:
-            downsample(fig)
-            canvas = FigureCanvasTkAgg(fig, master=self.plot_area)
-            toolbar = NavigationToolbar2Tk(canvas, self.plot_area, pack_toolbar=False)
-            canvas.draw()
+            for index, fig in enumerate(figures):
+                frame = ttk.Frame(self.preview_frame)
+                frames.append(frame)
+                if titles:
+                    ttk.Label(frame, text=titles[index], anchor=tk.W, padding=(4, 2)).pack(side=tk.TOP, fill=tk.X)
+                downsample(fig)
+                canvas = FigureCanvasTkAgg(fig, master=frame)
+                toolbar = NavigationToolbar2Tk(canvas, frame, pack_toolbar=False)
+                canvas.draw()
+                built.append({'figure': fig, 'frame': frame, 'canvas': canvas, 'toolbar': toolbar})
         except Exception:
-            if toolbar is not None:
-                toolbar.destroy()
-            if canvas is not None:
-                canvas.get_tk_widget().destroy()
-            plt.close(fig)
+            for frame in frames:
+                frame.destroy()
+            for fig in figures:
+                plt.close(fig)
             raise
-        if self.toolbar:
-            self.toolbar.destroy()
-        if self.canvas:
-            self.canvas.get_tk_widget().destroy()
-        if self.figure:
-            plt.close(self.figure)
-        self.figure = fig
-        self.canvas = canvas
-        self.toolbar = toolbar
-        toolbar.pack(side=tk.BOTTOM, fill=tk.X)
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        for preview in self.previews:
+            preview['frame'].destroy()
+            plt.close(preview['figure'])
+        for column in range(self.preview_frame.grid_size()[0]):
+            self.preview_frame.columnconfigure(column, weight=0, uniform='')
+        self.previews = built
+        self.figure, self.canvas, self.toolbar = (built[0][name] for name in ('figure', 'canvas', 'toolbar'))
+        self.preview_frame.rowconfigure(0, weight=1)
+        for index, preview in enumerate(built):
+            self.preview_frame.columnconfigure(index, weight=1, uniform='preview')
+            preview['frame'].grid(row=0, column=index, sticky='nsew')
+            preview['toolbar'].pack(side=tk.BOTTOM, fill=tk.X)
+            widget = preview['canvas'].get_tk_widget()
+            if len(built) > 1:
+                widget.configure(width=200, height=200)  # let the grid split the area evenly
+            widget.pack(fill=tk.BOTH, expand=True)
+            self._connect_legends(preview, kind)
+            preview['canvas'].draw_idle()
+
+    def _connect_legends(self, preview, kind):
+        """Make legends draggable; a dropped position applies to every shown figure."""
+        canvas, toolbar = preview['canvas'], preview['toolbar']
         legends = {}
-        for panel, axis in enumerate(fig.axes):
+        for panel, axis in enumerate(preview['figure'].axes):
             legend = axis.get_legend()
             if legend is not None:
                 legend.set_draggable(True, use_blit=False, update='loc')
                 legend.set_picker(lambda artist, mouse: (
-                    not bool(self.toolbar.mode) and artist.contains(mouse)[0], {}))
+                    not bool(toolbar.mode) and artist.contains(mouse)[0], {}))
                 legends[legend] = (panel, axis)
         picked = {'legend': None}
 
         def pick(event):
-            if not self.toolbar.mode and event.artist in legends:
+            if not toolbar.mode and event.artist in legends:
                 picked['legend'] = event.artist
 
         def release(_event):
             legend = picked.pop('legend', None)
-            if legend is None or self.toolbar.mode:
+            if legend is None or toolbar.mode:
                 return
             panel, axis = legends[legend]
-            bounds = legend.get_window_extent(self.canvas.get_renderer())
+            bounds = legend.get_window_extent(canvas.get_renderer())
             x, y = axis.transAxes.inverted().transform((bounds.x0, bounds.y0))
             if np.isfinite(x) and np.isfinite(y):
                 self.legend_positions[f'{kind}:{panel}'] = (float(x), float(y))
+                for other in self.previews:
+                    if other is not preview and panel < len(other['figure'].axes):
+                        apply_legend_positions(other['figure'], {panel: (float(x), float(y))})
+                        other['canvas'].draw_idle()
 
         canvas.mpl_connect('pick_event', pick)
         canvas.mpl_connect('button_release_event', release)
-        canvas.draw_idle()
 
     def export(self):
         paths = self.selected_paths()
@@ -1987,8 +2155,8 @@ class PlotterApp:
             self.root.after_cancel(self._config_timer)
             self._config_timer = None
         self.executor.shutdown(wait=False, cancel_futures=True)
-        if self.figure:
-            plt.close(self.figure)
+        for preview in self.previews:
+            plt.close(preview['figure'])
         self.root.destroy()
 
 

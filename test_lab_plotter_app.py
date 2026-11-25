@@ -712,6 +712,104 @@ class PlotterAppTests(unittest.TestCase):
                 error.assert_called_once()
                 self.assertEqual(list(self.app.signal_maps), ['other'])
 
+    def test_compare_two_measurements_side_by_side_with_linked_axes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            paths = [Path(folder) / name for name in ('a.mat', 'b.mat', 'c.mat')]
+            for path in paths:
+                path.touch()
+            self.app.insert_paths(paths)
+            items = list(self.app.files.get_children())
+            self.app.files.selection_set(items[0])
+            self.app.compare()
+            self.assertIn('Valitse kaksi mittausta', self.app.status.get())
+            values = {'a.mat': [0., 1.], 'b.mat': [0., 5.]}
+
+            def figure(payload, _options):
+                fig, axes = app_module.plt.subplots(2, 1, sharex=True)
+                axes[0].plot([0, 1], payload)
+                axes[1].plot([0, 2], payload)
+                return fig, axes
+
+            self.app.files.selection_set(items[:2])
+            selected = self.app.selected_paths()
+            with patch.object(app_module, 'load_plot_request', side_effect=lambda path, _: values[Path(path).name]), \
+                    patch.object(app_module, 'render_request', side_effect=figure) as render:
+                self.app.compare()
+                self.wait_idle()
+                self.assertEqual(len(self.app.previews), 2)
+                first, second = (preview['figure'] for preview in self.app.previews)
+                self.assertIs(self.app.figure, first)
+                self.assertEqual(first.axes[0].get_ylim(), second.axes[0].get_ylim())
+                self.assertEqual(first.axes[1].get_xlim(), second.axes[1].get_xlim())
+                self.assertGreaterEqual(first.axes[0].get_ylim()[1], 5.)
+                first.axes[0].set_xlim(.2, .4)
+                self.assertEqual(second.axes[0].get_xlim(), (.2, .4))
+                second.axes[1].set_ylim(-1., 1.)
+                self.assertEqual(first.axes[1].get_ylim(), (-1., 1.))
+                self.assertEqual(self.app.preview_source.get(), f'Vertailu: {selected[0]} | {selected[1]}')
+                self.assertIn('Verrataan: a.mat ja b.mat', self.app.status.get())
+                titles = [child.cget('text') for preview in self.app.previews
+                          for child in preview['frame'].winfo_children() if isinstance(child, app_module.ttk.Label)]
+                self.assertEqual(titles, ['a.mat', 'b.mat'])
+                calls = render.call_count
+                self.app.units_changed()
+                self.wait_idle()
+                self.assertEqual(render.call_count, calls + 2)
+                self.assertEqual(len(self.app.previews), 2)
+                self.app.compare_linked.set(False)
+                self.app.units_changed()
+                self.wait_idle()
+                first, second = (preview['figure'] for preview in self.app.previews)
+                self.assertNotEqual(first.axes[0].get_ylim(), second.axes[0].get_ylim())
+                first.axes[0].set_xlim(.1, .3)
+                self.assertNotEqual(second.axes[0].get_xlim(), (.1, .3))
+                self.app.language_choice.set('English')
+                self.app.choose_language()
+                self.assertTrue(self.app.preview_source.get().startswith('Comparison: '))
+                self.app.preview()
+                self.wait_idle()
+                self.assertEqual(len(self.app.previews), 1)
+                self.assertIsNone(self.app.compare_paths)
+                self.assertEqual(set(app_module.plt.get_fignums()), self.figure_numbers | {self.app.figure.number})
+
+    def test_processing_choice_per_trace_is_applied_and_reset(self):
+        self.app.kind.set('hfsi')
+        self.app.trace_tree.selection_set('hfsi:2:1')
+        self.app.trace_selected()
+        self.assertEqual(list(self.app.processing_box.cget('values')),
+                         ['vektorin pituus |x + jy|', 'reaaliosa', 'imaginaariosa'])
+        self.assertEqual(self.app.edit_processing.get(), 'vektorin pituus |x + jy|')
+        self.assertEqual(str(self.app.processing_box.cget('state')), 'readonly')
+        self.app.edit_processing.set('reaaliosa')
+        self.app.processing_box.event_generate('<<ComboboxSelected>>')
+        self.root.update()
+        self.assertEqual(self.app.transform_overrides['hfsi:2:1'],
+                         {'scale': '1', 'offset': '0', 'processing': 'real'})
+        self.assertEqual(self.app.options()['transforms']['hfsi:2:1']['processing'], 'real')
+        self.assertEqual(self.app.trace_tree.set('hfsi:2:1', 'stage'), 'reaaliosa')
+        self.assertIn('dq-koordinaatisto', self.app.trace_tree.set('hfsi:1:0', 'stage'))
+        self.app.trace_tree.selection_set('hfsi:2:1')
+        self.app.reset_transform()
+        self.assertNotIn('hfsi:2:1', self.app.transform_overrides)
+        self.assertEqual(self.app.trace_tree.set('hfsi:2:1', 'stage'), 'vektorin pituus |x + jy|')
+        self.app.trace_tree.selection_set('panel:hfsi:0')
+        self.app.trace_selected()
+        self.assertEqual(str(self.app.processing_box.cget('state')), 'disabled')
+
+        self.app.kind.set('custom')
+        self.app.groups = [['i_c_abc', 'wm_ref']]
+        self.app.signal_catalog = self.catalog(['i_c_abc[0]', 'i_c_abc[1]', 'i_c_abc[2]', 'wm_ref'])
+        self.app.refresh_groups()
+        operations = {trace['input']: trace['operations'] for trace in self.app.trace_records.values()}
+        self.assertIn('magnitude', operations['i_c_abc'])
+        self.assertNotIn('magnitude', operations['wm_ref'])
+        self.assertIn('derivative', operations['wm_ref'])
+        self.app.trace_tree.selection_set('custom:0:i_c_abc')
+        self.app.trace_selected()
+        self.app.edit_processing.set('vektorin pituus |x + jy|')
+        self.app.assign_transform()
+        self.assertEqual(self.app.options()['transforms']['custom:0:i_c_abc']['processing'], 'magnitude')
+
     def test_link_editor_shows_block_paths_and_full_signal_listing(self):
         keys = ['wm_ref', 'theta_m_out', 'i_c_abc[0]', 'i_c_abc[1]', 'i_c_abc[2]', 'unused']
         paths = {'theta_m_out': 'Model Root/CTRL/Observer/MATLAB Function',
@@ -911,7 +1009,7 @@ class PlotterAppTests(unittest.TestCase):
             self.app.edit_scale.set('n_p')
             self.app.edit_offset.set('0.5')
             self.app.assign_transform()
-            expected = {'scale': 'n_p', 'offset': '0.5'}
+            expected = {'scale': 'n_p', 'offset': '0.5', 'processing': 'none'}
             self.app.axis_limits['hfsi:0'] = (-1., 1.)
             self.app.axis_tick_steps['hfsi:0'] = (.5, .1)
             self.app.parameters['x_minor_step'].set('.05')

@@ -148,6 +148,24 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Duplicate'):
             load_motor_profiles(self.path)
 
+    def test_processing_in_transforms_and_configured_signals(self):
+        preset = dict(self.scenario, transforms={'overview:1:1': {'processing': 'real'},
+                                                 'overview:0:0': {'scale': '2'}})
+        configured = {'id': 'proc', 'label': 'Proc', 'kind': 'configured', 'suffix': '_p', 'columns': 1,
+                      'panels': [{'title': 'x', 'signals': [{'key': 'i_s', 'processing': 'magnitude'}]}]}
+        self.write('scenarios', [preset, configured])
+        result = load_scenarios(self.path)
+        self.assertEqual(result['variant']['transforms']['overview:1:1'],
+                         {'scale': '1', 'offset': '0', 'processing': 'real'})
+        self.assertNotIn('processing', result['variant']['transforms']['overview:0:0'])
+        self.assertEqual(result['proc']['panels'][0]['signals'][0]['processing'], 'magnitude')
+        for scenario in [dict(preset, transforms={'overview:1:1': {'processing': 'sqrt'}}),
+                         dict(configured, panels=[{'title': 'x', 'signals': [{'key': 'a', 'processing': 1}]}])]:
+            with self.subTest(scenario=scenario):
+                self.write('scenarios', [scenario])
+                with self.assertRaisesRegex(ValueError, 'unknown processing'):
+                    load_scenarios(self.path)
+
     def test_role_keys_in_scenarios_and_role_default_units(self):
         configured = {'id': 'roles', 'label': 'Roles', 'kind': 'configured', 'suffix': '_r', 'columns': 1,
                       'panels': [{'title': 'Mixed', 'signals': [

@@ -9,6 +9,8 @@ A local desktop application for exploring dSPACE ControlDesk measurements saved 
 - Select motor profiles and display quantities in SI, per-unit, or rated-torque values.
 - Link the quantities of the built-in plots to the signal names of your dSPACE model in a link editor, and save the links as reusable profiles.
 - Set time windows, subplot limits, tick spacing, grid visibility, colors, and draggable legends.
+- Change the derived processing of each trace, such as magnitude or real part of a vector, or angle wrapping.
+- Compare two measurements side by side with shared axis limits and zoom.
 - Detect transients from reference changes or measurement deviations.
 
 ## Quick start
@@ -30,6 +32,7 @@ Choose the interface language with **Kieli / Language** at the top of the sideba
 1. Add files with **Files…** (**Tiedostot…**) or a folder with **Folder…** (**Kansio…**). Select the active file and choose **Preview** (**Esikatsele**) to preview it.
 2. Select a signal-map profile that matches your dSPACE model and check its status line (see [Signal maps](#signal-maps)). Select a motor profile and verify its values. Profile fields can be edited for the current session. Rated torque uses the displayed nominal torque in Nm.
 3. Select multiple files with Ctrl or Shift and choose **Save selected as PDF** (**Tallenna valitut PDF**) to export them. PDFs are saved beside their source files by default; existing files require confirmation before replacement.
+4. To compare two measurements, select both with Ctrl and choose **Compare side by side** (**Vertaa vierekkäin**). Both are drawn with the same figure type and settings, each with its own toolbar. With **Same axis limits and zoom when comparing** (**Samat akselirajat ja zoom vertailussa**) switched on, which is the default, corresponding axes use common limits and zooming or panning one figure also changes the other. Setting changes redraw the comparison, and **Preview** returns to a single figure.
 
 Y axes are automatically scaled from each visible curve's **entire recording**, including data outside the displayed time window. If all finite values on an axis are nonnegative, the lower limit is −0.05 in the displayed units. Manual subplot bounds override the automatic limits.
 
@@ -78,7 +81,20 @@ A key that starts with `@` names a quantity role instead of a recording key, for
 
 Mechanical rpm is converted to rad/s in SI display. `Wb` and `Vs` are equivalent here. Signals with different quantities can share an axis, but checking their scale and unit compatibility is the user's responsibility.
 
-Each signal is transformed as `scale * y + offset` **before** unit conversion. Expressions support numbers, parentheses, `+ - * /`, and the names `n_p`, `sqrt3`, `u_base`, `i_base`, `w_base`, `psi_base`, `tau_base`, and `tau_nom`; Python calls are not allowed. A signal marked `rad/s (mechanical)` is normalized using the mechanical base speed. Do not also multiply by pole pairs unless that is intentional.
+Each signal is first given its derived processing and then transformed as `scale * y + offset` **before** unit conversion. Expressions support numbers, parentheses, `+ - * /`, and the names `n_p`, `sqrt3`, `u_base`, `i_base`, `w_base`, `psi_base`, `tau_base`, and `tau_nom`; Python calls are not allowed. A signal marked `rad/s (mechanical)` is normalized using the mechanical base speed. Do not also multiply by pole pairs unless that is intentional.
+
+### Derived processing
+
+Select a trace in the subplot tree and choose its **Processing** (**Käsittely**). The list offers only the operations that suit that trace:
+
+| Trace | Operations (`processing` id) |
+| --- | --- |
+| Vector quantity in a preset, such as estimated flux, voltage, or dq current | magnitude `magnitude`, real part `real`, imaginary part `imag` |
+| Angle in a preset, such as rotor angle or angle error | `none`, wrap to (−π, π] `wrap`, `unwrap`, `degrees`, wrap to (−180°, 180°] `wrap_degrees`, wrapped mechanical degrees `wrap_mech_degrees` (÷ `n_p`) |
+| Other preset quantity, such as speed or torque | `none`, absolute value `abs` |
+| Custom or configured signal | `none`, `abs`, the angle operations, and time derivative `derivative`; for a 2- or 3-element vector also `magnitude`, `real`, `imag`, and angle `angle` |
+
+Preset traces keep the quantity of their axis, so, for example, the angle of a normalized flux is not offered. Vector operations combine the components of a custom vector into one trace (`|i_c_abc|`, `Re(…)`, `Im(…)`, `∠…`); 3-element signals are treated as abc space vectors. Angle results are shown in `rad` or `deg` without unit conversion, and a derivative is shown per second. In configuration files, set `"processing"` in an item of `transforms` or in a configured signal, for example `{"overview:1:1": {"processing": "real"}}`. A transform's missing `scale` is `1`, which replaces the preset gain.
 
 ### Built-in scenarios
 

@@ -33,6 +33,11 @@ Wherever a scenario names a recording key (configured signals, added traces,
 units), ``@role`` instead selects the key the active signal map links to that
 role, e.g. ``@w_m_ref``. A configured ``@role`` signal without a unit uses the
 role's recorded unit from SIGNAL_ROLES (ROLE_UNITS).
+
+Transforms and configured signals may also name a derived ``processing``
+(PROCESSING_IDS), applied before scale and offset: e.g. ``magnitude`` or
+``real`` of a vector, ``wrap`` or ``degrees`` of an angle. Which operations a
+built-in trace accepts is checked when it is plotted.
 """
 
 import ast
@@ -75,6 +80,13 @@ SIGNAL_ROLES = (
 SIGNAL_ROLE_IDS = tuple(role for role, *_ in SIGNAL_ROLES)
 ROLE_UNITS = {role: unit for role, *_, unit in SIGNAL_ROLES}
 ROLE_PREFIX = '@'
+# Derived processing of a trace (see lab_plotter_core.PROCESSING). Scalar
+# operations act on each recorded component; vector operations first combine a
+# 2-element (x + jy) or 3-element (abc) signal into a complex space vector.
+SCALAR_PROCESSING = ('none', 'abs', 'wrap', 'unwrap', 'degrees', 'wrap_degrees',
+                     'wrap_mech_degrees', 'derivative')
+VECTOR_PROCESSING = ('magnitude', 'real', 'imag', 'angle')
+PROCESSING_IDS = SCALAR_PROCESSING + VECTOR_PROCESSING
 
 
 def signal_role(key):
@@ -183,10 +195,19 @@ def _expression(value, where):
     return value
 
 
+def _processing(value, where):
+    if not isinstance(value, str) or value not in PROCESSING_IDS:
+        raise ValueError(f'{where}: unknown processing {value!r}; use one of {list(PROCESSING_IDS)}')
+    return value
+
+
 def _transform(value, where):
-    _object(value, set(), {'scale', 'offset'}, where)
-    return {'scale': _expression(value.get('scale', '1'), f'{where}.scale'),
-            'offset': _expression(value.get('offset', '0'), f'{where}.offset')}
+    _object(value, set(), {'scale', 'offset', 'processing'}, where)
+    result = {'scale': _expression(value.get('scale', '1'), f'{where}.scale'),
+              'offset': _expression(value.get('offset', '0'), f'{where}.offset')}
+    if 'processing' in value:
+        result['processing'] = _processing(value['processing'], f'{where}.processing')
+    return result
 
 
 def _builtin(item, kind):
@@ -247,7 +268,7 @@ def _configured(item):
             raise ValueError('panel signals must be a nonempty list')
         keys = set()
         for signal in signals:
-            _object(signal, {'key'}, {'key', 'unit', 'scale', 'offset'}, 'signal')
+            _object(signal, {'key'}, {'key', 'unit', 'scale', 'offset', 'processing'}, 'signal')
             key = _key(signal['key'], 'signal key')
             if key in keys:
                 raise ValueError(f'Duplicate signal key in panel: {key}')
@@ -256,6 +277,8 @@ def _configured(item):
                                    'signal unit')
             signal['scale'] = _expression(signal.get('scale', '1'), 'signal scale')
             signal['offset'] = _expression(signal.get('offset', '0'), 'signal offset')
+            if 'processing' in signal:
+                _processing(signal['processing'], 'signal processing')
 
 
 def load_scenarios(path=SCENARIO_PATH) -> dict[str, dict]:

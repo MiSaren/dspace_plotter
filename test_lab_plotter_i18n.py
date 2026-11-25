@@ -8,7 +8,7 @@ from pathlib import Path
 
 import lab_plotter_i18n as i18n
 from lab_plotter_config import SIGNAL_ROLES
-from lab_plotter_core import FIGURE_TYPES, subplot_traces
+from lab_plotter_core import FIGURE_TYPES, PROCESSING_LABELS, subplot_traces
 
 APP_SOURCE = Path(__file__).with_name('lab_plotter_app.py')
 
@@ -30,6 +30,9 @@ class TranslationTests(unittest.TestCase):
                 texts.add(argument.value)
         texts |= {label for _, label, *_ in SIGNAL_ROLES}
         texts |= {trace['title'] for kind in FIGURE_TYPES for trace in subplot_traces(kind)}
+        texts |= {trace['note'] for kind in FIGURE_TYPES for trace in subplot_traces(kind) if trace['note']}
+        texts |= set(PROCESSING_LABELS.values())
+        texts |= {'recorded p.u.; converted to rated torque', 'added, own time raster of the recording'}
         self.assertGreater(len(texts), 100)
         self.assertEqual(sorted(text for text in texts if text not in i18n.FINNISH and text not in i18n.NEUTRAL), [])
         for english, finnish in i18n.FINNISH.items():

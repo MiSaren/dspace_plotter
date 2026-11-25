@@ -386,6 +386,104 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual([trace['source'] for trace in traces], ['@w_m_ref → absent / wm_ref', 'tau_m'])
         self.assertEqual([trace['roles'] for trace in traces], [('w_m_ref',), ()])
 
+    def filled_context(self, samples=40):
+        """A context whose quantities are all finite, with derived values recomputed."""
+        context = self.load(SyntheticData(), t_offset=2, t_span=(0, 3))
+        rng = np.random.default_rng(7)
+        context.t = np.linspace(2, 5, samples)
+        for role in core.SIGNAL_ROLE_IDS:
+            value = rng.normal(size=samples) * 3
+            if role in core.VECTOR_ROLES:
+                value = value + 1j*rng.normal(size=samples)
+            setattr(context, role, value)
+        context.theta_mest = context.theta_m.copy()
+        context.theta_err = context.theta_meas - context.theta_m
+        context.w_m = context.w_mest
+        context.i_c = context.i_cs*np.exp(-1j*context.theta_m)
+        context.u_s = np.abs(context.u_c)
+        context.theta_err_M = np.degrees(np.angle(np.exp(1j*context.theta_err)))/context.base.n_p
+        context.eps_inj_M = np.degrees(context.eps_inj)
+        return context
+
+    def test_default_processing_reproduces_every_preset_trace(self):
+        context = self.filled_context()
+        for kind in core.FIGURE_TYPES:
+            traces = core.subplot_traces(kind)
+            baseline, axes = core.plot_measurement(context, kind, downsample_output=False)
+            expected = [np.asarray(line.get_ydata()) for axis in np.asarray(axes).flat for line in axis.lines]
+            plt.close(baseline)
+            transforms = {trace['id']: {'scale': trace['scale'], 'offset': '0',
+                                        'processing': trace['processing']} for trace in traces}
+            fig, axes = core.plot_measurement(context, kind, transforms=transforms, downsample_output=False)
+            actual = [np.asarray(line.get_ydata()) for axis in np.asarray(axes).flat for line in axis.lines]
+            plt.close(fig)
+            for trace, before, after in zip(traces, expected, actual):
+                with self.subTest(kind=kind, trace=trace['id']):
+                    self.assertIn(trace['processing'], trace['operations'])
+                    np.testing.assert_allclose(after, before, rtol=1e-12, atol=1e-12)
+
+    def test_preset_processing_choices_recompute_from_the_input(self):
+        context = self.filled_context()
+        base = context.base
+        cases = [('hfsi:2:1', 'real', context.psi_sest.real/base.psi),
+                 ('hfsi:1:0', 'magnitude', np.abs(context.i_c)/base.i),
+                 ('hfsi:3:1', 'wrap_degrees', np.degrees(np.angle(np.exp(1j*context.theta_err)))),
+                 ('hfsi:5:0', 'unwrap', np.unwrap(context.theta_mest)),
+                 ('hfsi:0:0', 'abs', np.abs(context.w_m_ref)/base.w)]
+        for trace_id, processing, expected in cases:
+            with self.subTest(trace=trace_id, processing=processing):
+                fig, axes = core.plot_measurement(context, 'hfsi', transforms={
+                    trace_id: {'scale': '1', 'offset': '0', 'processing': processing}}, downsample_output=False)
+                panel, line = map(int, trace_id.split(':')[1:])
+                np.testing.assert_allclose(axes.flat[panel].lines[line].get_ydata(), expected)
+                plt.close(fig)
+        traces = {trace['id']: trace for trace in core.subplot_traces('hfsi')}
+        self.assertEqual(traces['hfsi:2:1']['operations'], ('magnitude', 'real', 'imag'))
+        self.assertEqual(traces['hfsi:0:0']['operations'], ('none', 'abs'))
+        self.assertIn('dq frame', traces['hfsi:1:0']['stage'])
+        before = set(plt.get_fignums())
+        for trace_id, processing in [('hfsi:2:1', 'angle'), ('hfsi:0:0', 'degrees'), ('hfsi:3:0', 'real')]:
+            with self.subTest(trace=trace_id, processing=processing), \
+                    self.assertRaisesRegex(ValueError, 'not available'):
+                core.plot_measurement(context, 'hfsi', transforms={
+                    trace_id: {'scale': '1', 'offset': '0', 'processing': processing}})
+        self.assertEqual(set(plt.get_fignums()), before)
+
+    def test_custom_and_added_processing_combine_vectors_and_mark_units(self):
+        data = SyntheticData()
+        data.signals['flux[0]'] = (data.t.copy(), np.array([3., 0., -3., 0.]))
+        data.signals['flux[1]'] = (data.t.copy(), np.array([4., 1., 4., 0.]))
+        data.signals['angle'] = (data.t.copy(), np.array([0., 3., 6., 9.]))
+        original = data.signal_info
+        data.signal_info = lambda key: ([info for name in ('flux[0]', 'flux[1]') for info in original(name)]
+                                        if key == 'flux' else original(key))
+        transforms = {'custom:0:flux': {'scale': '1', 'offset': '0', 'processing': 'magnitude'},
+                      'custom:1:angle': {'scale': '1', 'offset': '0', 'processing': 'wrap_degrees'},
+                      'custom:2:wm_ref': {'scale': '1', 'offset': '0', 'processing': 'derivative'}}
+        fig, axes = core.plot_signals(data, [['flux'], ['angle'], ['wm_ref']], t_offset=2, per_unit=True,
+                                      units={'flux': 'Wb', 'angle': 'A'}, transforms=transforms)
+        self.assertEqual([line.get_label() for line in axes[0].lines], ['|flux| (p.u.)'])
+        np.testing.assert_allclose(axes[0].lines[0].get_ydata(), np.array([5., 1., 5., 0.])/core.DEFAULT_BASE.psi)
+        self.assertEqual(axes[1].lines[0].get_label(), 'angle (deg)')
+        np.testing.assert_allclose(axes[1].lines[0].get_ydata(), np.degrees(np.angle(np.exp(1j*np.array([0., 3., 6., 9.])))))
+        self.assertEqual(axes[2].lines[0].get_label(), 'dwm_ref/dt (raw/s)')
+        np.testing.assert_allclose(axes[2].lines[0].get_ydata(), np.gradient([0., 0., 2., 2.], data.t))
+        plt.close(fig)
+        before = set(plt.get_fignums())
+        for groups, change in [([['motor/current']], 'magnitude'), ([['wm_ref']], 'real'), ([['wm_ref']], 'bad')]:
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                core.plot_signals(data, groups, transforms={
+                    f'custom:0:{groups[0][0]}': {'scale': '1', 'offset': '0', 'processing': change}})
+        self.assertEqual(set(plt.get_fignums()), before)
+        context = self.load(data, t_offset=2, t_span=(0, 3), extra_signals=['flux'])
+        fig, axes = core.plot_measurement(context, 'overview', per_unit=False,
+                                          added_traces=[{'id': 'extra', 'panel': 1, 'key': 'flux'}],
+                                          transforms={'extra': {'scale': '1', 'offset': '0', 'processing': 'angle'}},
+                                          units={'flux': 'Wb'})
+        self.assertEqual(axes[1].lines[-1].get_label(), '∠flux (rad)')
+        np.testing.assert_allclose(axes[1].lines[-1].get_ydata(), np.angle(np.array([3+4j, 1j, -3+4j, 0])))
+        plt.close(fig)
+
     def test_trace_sources_and_roles_follow_signal_map(self):
         default = {trace['id']: trace for trace in core.subplot_traces('hfsi')}
         self.assertEqual(default['hfsi:4:2']['source'], 'tauLref / TL_ref')
